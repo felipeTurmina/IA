@@ -2,11 +2,13 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 
 // ─────────────────────────────────────────────
-// TEXTURAS
+// TEXTURAS — canvas cacheado + THREE.CanvasTexture cacheado na GPU
 // ─────────────────────────────────────────────
-const _texCache = {};
+const _canvasCache = {}; // cache do canvas 2D
+const _texCache    = {}; // cache da CanvasTexture (GPU) — evita VRAM duplicada
+
 function woodCanvas(type) {
-  if (_texCache[type]) return _texCache[type];
+  if (_canvasCache[type]) return _canvasCache[type];
   const cv = document.createElement("canvas");
   cv.width = cv.height = 512;
   const cx = cv.getContext("2d");
@@ -34,13 +36,20 @@ function woodCanvas(type) {
     }
   }
   cx.globalAlpha=1;
-  _texCache[type] = cv; return cv;
+  _canvasCache[type] = cv; return cv;
 }
 
+// Reutiliza a mesma CanvasTexture na GPU — só atualiza repeat por material
 function makeTex(key, w, h) {
-  const t = new THREE.CanvasTexture(woodCanvas(key));
+  if (!_texCache[key]) {
+    const t = new THREE.CanvasTexture(woodCanvas(key));
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    _texCache[key] = t;
+  }
+  const t = _texCache[key].clone(); // clone leve: compartilha GPU buffer, repeat independente
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   t.repeat.set(w/0.5, h/0.5);
+  t.needsUpdate = false;
   return t;
 }
 
@@ -176,14 +185,48 @@ function makeHandle(pW, pH, pD) {
 }
 
 // ─────────────────────────────────────────────
-// FÁBRICA DE PEÇAS
+// CANALETAS (trilhos) para porta de correr
 // ─────────────────────────────────────────────
-let GID = 1;
+function makeTrack(pW, pH, pD) {
+  const g = new THREE.Group();
+  g.userData.isTrack = true;
+  const metalMat = new THREE.MeshStandardMaterial({color:0xb0b8c8, roughness:0.2, metalness:0.85});
+  const trackW = pW + 0.012; // um pouco mais largo que a porta
+  const trackT = 0.006;      // espessura do trilho
+  const trackD = 0.014;      // profundidade do canal
+
+  // Trilho superior
+  const topGeo = new THREE.BoxGeometry(trackW, trackT, trackD);
+  const top = new THREE.Mesh(topGeo, metalMat);
+  top.position.set(0, pH/2 + trackT/2, 0);
+  top.castShadow = true;
+
+  // Trilho inferior
+  const botGeo = new THREE.BoxGeometry(trackW, trackT, trackD);
+  const bot = new THREE.Mesh(botGeo, metalMat);
+  bot.position.set(0, -pH/2 - trackT/2, 0);
+  bot.castShadow = true;
+
+  // Canal guia superior (rebaixo visível)
+  const chanMat = new THREE.MeshStandardMaterial({color:0x606878, roughness:0.4, metalness:0.6});
+  const chanH  = trackT * 0.5;
+  const chanTop = new THREE.Mesh(new THREE.BoxGeometry(trackW - 0.004, chanH, trackD * 0.4), chanMat);
+  chanTop.position.set(0, pH/2 + trackT - chanH/2, 0);
+
+  const chanBot = new THREE.Mesh(new THREE.BoxGeometry(trackW - 0.004, chanH, trackD * 0.4), chanMat);
+  chanBot.position.set(0, -pH/2 - trackT + chanH/2, 0);
+
+  [top, bot, chanTop, chanBot].forEach(m => g.add(m));
+  return g;
+}
+// ID único seguro: baseado em timestamp — evita colisão ao recarregar
+let GID = Date.now();
 const animSet = new Set(); // peças em animação
 
 function makePiece(typeId, matId, x=0, y=0, z=0) {
   const tp = PTYPES.find(t=>t.id===typeId) || PTYPES[0];
-  const mid = (typeId==="vidro" && !matId.startsWith("vidro")) ? "vidro_c" : matId;
+  // Fix: usa string vazia como fallback para evitar crash em startsWith
+  const mid = (typeId==="vidro" && !(matId||"").startsWith("vidro")) ? "vidro_c" : (matId||"ps_freijo");
   const {w,h,d} = tp;
   const id = GID++;
 
@@ -222,20 +265,25 @@ function makePiece(typeId, matId, x=0, y=0, z=0) {
       body.castShadow = true; body.receiveShadow = true;
       body.userData.isBody = true;
       grp.add(body);
+      // Canaletas — adicionadas sempre, visibilidade controlada por doorType
+      const track = makeTrack(w, h, d);
+      track.visible = false; // default: porta de abrir, sem trilho
+      grp.add(track);
     }
 
     grp.add(makeHandle(w, h, d));
 
     grp.userData = {
       id, typeId, matId:mid,
-      frontMatId: mid,   // material da frente (gaveta)
+      frontMatId: mid,
       w, h, d,
       rx:0, ry:0, rz:0,
       label:`${tp.label} ${id}`,
       isOpen:false, openProgress:0,
       baseX:x, baseZ:z, baseRY:0,
       hasHandle: true,
-      doorSide: "left",  // "left" | "right"
+      doorSide: "left",   // "left" | "right" — para porta de abrir
+      doorType: "hinged", // "hinged" | "sliding"
     };
     return grp;
   }
@@ -280,6 +328,17 @@ function rebuildPiece(obj) {
     const newH = makeHandle(w, h, d);
     newH.visible = obj.userData.hasHandle !== false;
     obj.add(newH);
+    // rebuild track (porta de correr)
+    if (typeId === "porta") {
+      const oldT = obj.children.find(c=>c.userData.isTrack);
+      if (oldT) {
+        oldT.traverse(c=>{ if(c.isMesh){c.geometry.dispose(); c.material.dispose();} });
+        obj.remove(oldT);
+      }
+      const newT = makeTrack(w, h, d);
+      newT.visible = obj.userData.doorType === "sliding";
+      obj.add(newT);
+    }
   } else {
     obj.geometry.dispose();
     obj.geometry = new THREE.BoxGeometry(w,h,d);
@@ -345,7 +404,15 @@ function tickAnimations(dt) {
     if (ud.typeId === "gaveta") {
       obj.position.z = ud.baseZ + ud.openProgress * ud.d * 0.85;
     } else if (ud.typeId === "porta") {
-      applyDoorTransform(obj, ud.openProgress);
+      if (ud.doorType === "sliding") {
+        // Porta de correr: desliza em X pela largura da porta
+        const dir = ud.doorSide === "right" ? 1 : -1;
+        obj.position.x = ud.baseX + ud.openProgress * ud.w * dir;
+        obj.rotation.y  = ud.baseRY; // sem rotação
+        obj.position.z  = ud.baseZ;
+      } else {
+        applyDoorTransform(obj, ud.openProgress);
+      }
     }
 
     if (Math.abs(ud.openProgress - target) < 0.003) {
@@ -353,7 +420,14 @@ function tickAnimations(dt) {
       if (ud.typeId === "gaveta") {
         obj.position.z = ud.baseZ + target * ud.d * 0.85;
       } else if (ud.typeId === "porta") {
-        applyDoorTransform(obj, target);
+        if (ud.doorType === "sliding") {
+          const dir = ud.doorSide === "right" ? 1 : -1;
+          obj.position.x = ud.baseX + target * ud.w * dir;
+          obj.rotation.y = ud.baseRY;
+          obj.position.z = ud.baseZ;
+        } else {
+          applyDoorTransform(obj, target);
+        }
       }
       animSet.delete(obj);
     }
@@ -369,7 +443,7 @@ function getOutlineBox(obj) {
   // Para grupos (porta/gaveta) usa dimensões do userData — tamanho fixo, sem flicker
   if (obj.isGroup && obj.userData.w) {
     const {w, h, d} = obj.userData;
-    return { size: new THREE.Vector3(w + 0.008, h + 0.008, d + 0.008), center: obj.position.clone().setY(obj.position.y) };
+    return { size: new THREE.Vector3(w + 0.008, h + 0.008, d + 0.008), center: obj.position.clone() };
   }
   // Para meshes simples usa bounding box
   const box = new THREE.Box3().setFromObject(obj);
@@ -410,27 +484,60 @@ function syncOutline(obj, scene) {
 }
 
 // ─────────────────────────────────────────────
-// SNAP — grade de 5cm para alinhar com GridHelper
+// SNAP — grade de 5cm + snap magnético entre peças (estilo SketchUp)
 // ─────────────────────────────────────────────
-const GRID = 0.05; // 5cm — igual ao tamanho de cada quadrado da grade
+const GRID = 0.05;
 function snapGrid(v, g=GRID) { return Math.round(v/g)*g; }
-function edgeSnap(moving, others, thr=0.035) {
-  const mb = new THREE.Box3().setFromObject(moving);
-  let best=null, bd=thr;
+
+// Retorna Box3 usando userData.w/h/d (sem percorrer geometrias — muito mais leve)
+function fastBox(obj) {
+  const {w=0.1, h=0.1, d=0.1} = obj.userData;
+  const p = obj.position;
+  return new THREE.Box3(
+    new THREE.Vector3(p.x - w/2, p.y - h/2, p.z - d/2),
+    new THREE.Vector3(p.x + w/2, p.y + h/2, p.z + d/2)
+  );
+}
+
+// Snap magnético entre bordas de peças — estilo SketchUp
+const SNAP_MAG = 0.04; // 4cm de alcance magnético
+function edgeSnap(moving, others) {
+  const mw = moving.userData.w || 0.1;
+  const md = moving.userData.d || 0.1;
+  const px = moving.position.x;
+  const pz = moving.position.z;
+  let bestX = null, bestZ = null, bdX = SNAP_MAG, bdZ = SNAP_MAG;
+
   for (const o of others) {
-    if (o===moving) continue;
-    const ob = new THREE.Box3().setFromObject(o);
-    const checks = [
-      {a:"x", mf:mb.max.x, tf:ob.min.x}, {a:"x", mf:mb.min.x, tf:ob.max.x},
-      {a:"y", mf:mb.max.y, tf:ob.min.y}, {a:"y", mf:mb.min.y, tf:ob.max.y},
-      {a:"z", mf:mb.max.z, tf:ob.min.z}, {a:"z", mf:mb.min.z, tf:ob.max.z},
+    if (o === moving) continue;
+    const ow = o.userData.w || 0.1;
+    const od = o.userData.d || 0.1;
+    const ox = o.position.x;
+    const oz = o.position.z;
+
+    // Bordas em X: direita-esquerda e esquerda-direita
+    const checksX = [
+      (px + mw/2) - (ox - ow/2),  // borda dir moving → borda esq other
+      (px - mw/2) - (ox + ow/2),  // borda esq moving → borda dir other
+      px - ox,                     // centros alinhados em X
     ];
-    for (const c of checks) {
-      const dist = Math.abs(c.mf - c.tf);
-      if (dist < bd) { bd=dist; best={a:c.a, delta:c.tf-c.mf}; }
+    for (const delta of checksX) {
+      if (Math.abs(delta) < bdX) { bdX = Math.abs(delta); bestX = delta; }
+    }
+
+    // Bordas em Z
+    const checksZ = [
+      (pz + md/2) - (oz - od/2),
+      (pz - md/2) - (oz + od/2),
+      pz - oz,
+    ];
+    for (const delta of checksZ) {
+      if (Math.abs(delta) < bdZ) { bdZ = Math.abs(delta); bestZ = delta; }
     }
   }
-  if (best) moving.position[best.a] += best.delta;
+
+  if (bestX !== null) moving.position.x = snapGrid(moving.position.x - bestX);
+  if (bestZ !== null) moving.position.z = snapGrid(moving.position.z - bestZ);
 }
 
 // ─────────────────────────────────────────────
@@ -476,6 +583,16 @@ export default function App() {
   const [editingId,   setEditingId]   = useState(null);
   const [editingName, setEditingName] = useState("");
   const renameRef = useRef(null);
+
+  // Preços editáveis globalmente
+  const [prices, setPrices] = useState({
+    chapaW: 2750,   // largura chapa mm
+    chapaH: 1850,   // altura chapa mm
+    priceM2: 145,   // R$/m² material
+    fitaM: 0.85,    // R$/m fita de borda
+    corteChapa: 18, // R$ por chapa (custo de corte/serra)
+    moObraM2: 0,    // R$/m² mão de obra (opcional)
+  });
 
   // ── INIT THREE.JS ──────────────────────────────────────────────
   useEffect(() => {
@@ -578,6 +695,9 @@ export default function App() {
     }
     addOutline(obj, sceneRef.current);
     const ud = obj.userData;
+    // Outline laranja = bloqueada, azul = livre
+    const ol = sceneRef.current?.children?.find(c => c.userData[OUTLINE_TAG]);
+    if (ol) ol.material.color.set(ud.locked ? 0xff8800 : 0x44aaff);
     setSelId(ud.id);
     setSelData({
       ...ud,
@@ -585,10 +705,12 @@ export default function App() {
       hasHandle: ud.hasHandle !== false,
       frontMatId: ud.frontMatId || ud.matId,
       doorSide: ud.doorSide || "left",
+      doorType: ud.doorType || "hinged",
+      locked: ud.locked || false,
     });
     setActMat(ud.matId);
     if (ud.typeId !== "gaveta") setMatTarget("corpo");
-    setStatus(`✓ ${ud.label}`);
+    setStatus(ud.locked ? `🔒 ${ud.label} (bloqueada)` : `✓ ${ud.label}`);
   }, []);
 
   // ── NDC ───────────────────────────────────────────────────────
@@ -613,6 +735,8 @@ export default function App() {
         const target = resolveHit(hits[0].object, piecesRef.current);
         if (target) {
           selectObj(target);
+          // Peça bloqueada: seleciona mas não ativa drag
+          if (target.userData.locked) return;
           // Plano de drag na altura Y do objeto
           dplane.current.setFromNormalAndCoplanarPoint(
             new THREE.Vector3(0,1,0),
@@ -657,6 +781,8 @@ export default function App() {
       if (rc.current.ray.intersectPlane(dplane.current, pt)) {
         selRef.current.position.x = snapGrid(pt.x + (dragS.current.ox || 0));
         selRef.current.position.z = snapGrid(pt.z + (dragS.current.oz || 0));
+        // Snap magnético entre bordas de peças (leve — usa userData, não Box3)
+        edgeSnap(selRef.current, piecesRef.current);
         syncOutline(selRef.current, sceneRef.current);
       }
     }
@@ -697,7 +823,7 @@ export default function App() {
   const addPiece = useCallback(() => {
     const x = snapGrid((Math.random()-0.5)*0.8);
     const z = snapGrid((Math.random()-0.5)*0.8);
-    const mid = (actType==="vidro" && !actMat.startsWith("vidro")) ? "vidro_c" : actMat;
+    const mid = (actType==="vidro" && !(actMat||"").startsWith("vidro")) ? "vidro_c" : (actMat||"ps_freijo");
     const obj = makePiece(actType, mid, x, 0, z);
     obj.userData.baseX = obj.position.x;
     obj.userData.baseZ = obj.position.z;
@@ -715,7 +841,18 @@ export default function App() {
     clearOutline(sceneRef.current);
     animSet.delete(obj);
     sceneRef.current.remove(obj);
-    obj.traverse(c => { if (c.isMesh) { c.geometry.dispose(); c.material.dispose(); } });
+    // Fix memory leak: descarta textura (map) antes do material
+    obj.traverse(c => {
+      if (c.isMesh) {
+        c.geometry.dispose();
+        if (Array.isArray(c.material)) {
+          c.material.forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
+        } else {
+          if (c.material.map) c.material.map.dispose();
+          c.material.dispose();
+        }
+      }
+    });
     piecesRef.current = piecesRef.current.filter(p => p !== obj);
     setPieces(prev => prev.filter(p => p.id !== obj.userData.id));
     selectObj(null);
@@ -848,6 +985,22 @@ export default function App() {
     setStatus(!nowVisible ? `🔩 Maçaneta adicionada` : `🚫 Maçaneta removida`);
   }, []);
 
+  // ── TOGGLE LOCK (bloqueia movimentação) ───────────────────────
+  const toggleLock = useCallback(() => {
+    const obj = selRef.current; if (!obj?.userData) return;
+    const nowLocked = !obj.userData.locked;
+    obj.userData.locked = nowLocked;
+    // Outline laranja quando bloqueado, azul quando livre
+    const ol = sceneRef.current.children.find(c => c.userData[OUTLINE_TAG]);
+    if (ol) ol.material.color.set(nowLocked ? 0xff8800 : 0x44aaff);
+    setSelData(d => ({...d, locked: nowLocked}));
+    // Atualiza lista de peças para refletir cadeado no nome
+    setPieces(prev => prev.map(p =>
+      p.id === obj.userData.id ? {...p, locked: nowLocked} : p
+    ));
+    setStatus(nowLocked ? `🔒 ${obj.userData.label} bloqueada` : `🔓 ${obj.userData.label} desbloqueada`);
+  }, []);
+
   // ── TOGGLE LADO DA PORTA ──────────────────────────────────────
   const toggleDoorSide = useCallback(() => {
     const obj = selRef.current; if (!obj?.userData) return;
@@ -867,7 +1020,26 @@ export default function App() {
     setStatus(`🚪 Dobradiça: ${newSide === "left" ? "Esquerda" : "Direita"}`);
   }, []);
 
-  // ── SET VIEW ──────────────────────────────────────────────────
+  // ── TOGGLE TIPO DA PORTA (abrir / correr) ────────────────────
+  const toggleDoorType = useCallback((newType) => {
+    const obj = selRef.current; if (!obj?.userData) return;
+    if (obj.userData.typeId !== "porta") return;
+    // Fecha a porta antes de mudar o tipo
+    if (obj.userData.isOpen) {
+      obj.userData.isOpen = false;
+      obj.userData.openProgress = 0;
+      obj.position.x = obj.userData.baseX;
+      obj.position.z = obj.userData.baseZ;
+      obj.rotation.y = obj.userData.baseRY;
+      animSet.delete(obj);
+    }
+    obj.userData.doorType = newType;
+    // Mostra/oculta canaletas
+    const track = obj.children.find(c => c.userData.isTrack);
+    if (track) track.visible = (newType === "sliding");
+    setSelData(d => ({...d, doorType: newType, isOpen: false}));
+    setStatus(newType === "sliding" ? `🛤 Porta de correr (canaleta)` : `🚪 Porta de abrir (dobradiça)`);
+  }, []);
   const setView = useCallback((v) => {
     const s = sph.current; s.cx=0; s.cy=0.4; s.cz=0;
     if (v==="iso")   { s.phi=0.65; s.theta=0.8;        s.radius=3.5; }
@@ -927,13 +1099,15 @@ export default function App() {
         </div>
 
         {/* Tabs */}
-        <div style={{display:"flex",borderBottom:"1px solid #1e2040",flexShrink:0}}>
-          {[["add","Construir"],["edit","Editar"],["mat","Material"],["cam","Vista"]].map(([k,l])=>(
+        <div style={{display:"flex",borderBottom:"1px solid #1e2040",flexShrink:0,flexWrap:"wrap"}}>
+          {[["add","🪚"],["edit","✏️"],["mat","🎨"],["cam","👁"],["cut","📐"]].map(([k,lbl])=>(
             <div key={k} onClick={()=>setTab(k)} style={{flex:1,padding:"7px 0",textAlign:"center",
-              fontSize:9,cursor:"pointer",letterSpacing:0.5,
+              fontSize:11,cursor:"pointer",
               background:tab===k?"#1a2240":"transparent",
               borderBottom:tab===k?"2px solid #4a7aaa":"2px solid transparent",
-              color:tab===k?"#8ab8e0":"#3a5060",transition:"all 0.12s"}}>{l}</div>
+              color:tab===k?"#8ab8e0":"#3a5060",transition:"all 0.12s"}}
+              title={["Construir","Editar","Material","Vista","Plano de Corte"][["add","edit","mat","cam","cut"].indexOf(k)]}
+            >{lbl}</div>
           ))}
         </div>
 
@@ -962,11 +1136,11 @@ export default function App() {
             <div style={{maxHeight:170,overflowY:"auto"}}>
               {pieces.length===0 && <div style={{fontSize:10,color:"#3a4a5a",padding:"8px 0",textAlign:"center"}}>Nenhuma peça</div>}
               {pieces.map(p=>(
-                <div key={p.id} onClick={()=>{ if(editingId!==p.id) selFromList(p.id); }}
-                  style={{display:"flex",alignItems:"center",gap:5,padding:"3px 5px 3px 7px",marginBottom:2,
-                    borderRadius:4,cursor:"pointer",
-                    background:selId===p.id?"#1a3050":"#101018",
-                    border:`1px solid ${selId===p.id?"#3a6090":"#1a1a28"}`,fontSize:11}}>
+                <div key={p.id} onClick={()=>selFromList(p.id)}
+                  style={{display:"flex",alignItems:"center",gap:6,padding:"5px 6px",
+                    borderRadius:4,cursor:"pointer",marginBottom:2,
+                    background:selId===p.id?"#0e1e30":"#0a0a18",
+                    border:`1px solid ${selId===p.id?"#2a4a6a":"#141424"}`}}>
                   <span style={{fontSize:12,flexShrink:0}}>{tIcon(p.typeId)}</span>
                   {editingId===p.id
                     ? <input ref={renameRef} value={editingName}
@@ -979,18 +1153,22 @@ export default function App() {
                     : <span style={{flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",
                         color:selId===p.id?"#80b8f0":"#607080"}}>{p.label}</span>
                   }
-                  {editingId!==p.id &&
+                  {editingId!==p.id && <>
                     <span onClick={e=>startRename(p.id,p.label,e)} title="Renomear"
                       style={{flexShrink:0,fontSize:11,color:"#3a5a7a",padding:"1px 4px",
                         borderRadius:3,cursor:"pointer",
                         background:selId===p.id?"#1e3a5a":"transparent"}}>✏</span>
-                  }
-                  {editingId!==p.id &&
-                    <span onClick={e=>{e.stopPropagation(); selFromList(p.id); setTimeout(dupSel,30);}} title="Duplicar"
+                    <span onClick={e=>{e.stopPropagation();selFromList(p.id);setTimeout(dupSel,30);}} title="Duplicar"
                       style={{flexShrink:0,fontSize:11,color:"#3a6a4a",padding:"1px 4px",
                         borderRadius:3,cursor:"pointer",
                         background:selId===p.id?"#1a3a2a":"transparent"}}>📋</span>
-                  }
+                    <span onClick={e=>{e.stopPropagation();selFromList(p.id);setTimeout(toggleLock,30);}} title={p.locked?"Desbloquear":"Bloquear"}
+                      style={{flexShrink:0,fontSize:11,padding:"1px 4px",borderRadius:3,cursor:"pointer",
+                        color:p.locked?"#ff8800":"#3a5a6a",
+                        background:p.locked?"#2a1800":selId===p.id?"#1a2a3a":"transparent"}}>
+                      {p.locked?"🔒":"🔓"}
+                    </span>
+                  </>}
                 </div>
               ))}
             </div>
@@ -1001,7 +1179,7 @@ export default function App() {
         {tab==="edit" && <>
           {!selId && <NoSel/>}
           {selData && <>
-            {/* Nome */}
+            {/* Nome + Bloqueio */}
             <S>
               <SL>Nome da Peça</SL>
               {editingId===selData.id
@@ -1024,6 +1202,26 @@ export default function App() {
                       style={{fontSize:12,color:"#4a7aaa",cursor:"pointer",padding:"0 2px"}}>✏</span>
                   </div>
               }
+              {/* Botão de bloqueio */}
+              <div onClick={toggleLock} style={{
+                display:"flex",alignItems:"center",gap:8,marginTop:6,
+                padding:"7px 10px",borderRadius:6,cursor:"pointer",
+                background:selData.locked?"#1a0e00":"#0e1018",
+                border:`2px solid ${selData.locked?"#cc6600":"#2a3a4a"}`,
+                transition:"all 0.15s"}}>
+                <span style={{fontSize:16}}>{selData.locked?"🔒":"🔓"}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,fontWeight:600,color:selData.locked?"#ff9900":"#4a7a9a"}}>
+                    {selData.locked?"Peça Bloqueada":"Peça Livre"}
+                  </div>
+                  <div style={{fontSize:9,color:"#4a5a6a"}}>
+                    {selData.locked?"não pode ser movida":"clique para bloquear"}
+                  </div>
+                </div>
+                <span style={{fontSize:9,color:selData.locked?"#884400":"#2a4a5a"}}>
+                  {selData.locked?"LOCK":"FREE"}
+                </span>
+              </div>
             </S>
 
             {/* Dimensões */}
@@ -1038,10 +1236,29 @@ export default function App() {
               </div>
             </S>
 
-            {/* Abrir/Fechar + Maçaneta */}
+            {/* Animação — gaveta e porta */}
             {isMovable && (
               <S>
                 <SL>{selData.typeId==="gaveta"?"🗄 Gaveta":"🚪 Porta"} — Animação</SL>
+
+                {/* Tipo da porta — só porta */}
+                {selData.typeId==="porta" && (
+                  <div style={{marginBottom:6}}>
+                    <SL>Tipo de Abertura</SL>
+                    <div style={{display:"flex",gap:4}}>
+                      {[["hinged","🚪 Dobradiça"],["sliding","🛤 Correr"]].map(([t,lbl])=>(
+                        <div key={t} onClick={()=>toggleDoorType(t)} style={{
+                          flex:1,padding:"8px 4px",borderRadius:6,cursor:"pointer",textAlign:"center",
+                          background:selData.doorType===t?"#1a2030":"#0e0e18",
+                          border:`2px solid ${selData.doorType===t?"#5a9aaa":"#252535"}`,
+                          transition:"all 0.15s"}}>
+                          <div style={{fontSize:16}}>{t==="hinged"?"🚪":"🛤"}</div>
+                          <div style={{fontSize:9,color:selData.doorType===t?"#80c0d0":"#506070",marginTop:2}}>{lbl}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Abrir/Fechar */}
                 <div onClick={toggleOpen} style={{
@@ -1055,12 +1272,10 @@ export default function App() {
                     <div style={{fontSize:12,fontWeight:600,color:selData.isOpen?"#70d070":"#7090d0"}}>
                       {selData.isOpen?"Aberta/Aberto":"Fechada/Fechado"}
                     </div>
-                    <div style={{fontSize:9,color:"#4a6060"}}>
-                      clique para {selData.isOpen?"fechar":"abrir"}
-                    </div>
+                    <div style={{fontSize:9,color:"#4a6060"}}>clique para {selData.isOpen?"fechar":"abrir"}</div>
                   </div>
                   <span style={{fontSize:10,color:selData.isOpen?"#3a7a3a":"#3a3a7a"}}>
-                    {selData.typeId==="gaveta"?"↔ desliza":"↻ 110°"}
+                    {selData.typeId==="gaveta"?"↔ desliza":selData.doorType==="sliding"?"↔ correr":"↻ 105°"}
                   </span>
                 </div>
 
@@ -1068,7 +1283,7 @@ export default function App() {
                 <div onClick={toggleHandle} style={{
                   display:"flex",alignItems:"center",gap:10,
                   padding:"9px 12px",borderRadius:7,cursor:"pointer",
-                  marginBottom: selData.typeId==="porta" ? 6 : 0,
+                  marginBottom:selData.typeId==="porta"?6:0,
                   background:selData.hasHandle?"#1a1a14":"#141414",
                   border:`2px solid ${selData.hasHandle?"#7a6a2a":"#3a3a2a"}`,
                   transition:"all 0.2s"}}>
@@ -1077,33 +1292,48 @@ export default function App() {
                     <div style={{fontSize:12,fontWeight:600,color:selData.hasHandle?"#c8a040":"#505040"}}>
                       {selData.hasHandle?"Com Puxador":"Sem Puxador"}
                     </div>
-                    <div style={{fontSize:9,color:"#4a6060"}}>
-                      clique para {selData.hasHandle?"remover":"adicionar"}
-                    </div>
+                    <div style={{fontSize:9,color:"#4a6060"}}>clique para {selData.hasHandle?"remover":"adicionar"}</div>
                   </div>
-                  <span style={{fontSize:10,color:selData.hasHandle?"#6a5020":"#303020"}}>
-                    {selData.hasHandle?"visible":"hidden"}
-                  </span>
                 </div>
 
-                {/* Lado da dobradiça — só porta */}
-                {selData.typeId==="porta" && (
+                {/* Lado da dobradiça — só porta de abrir */}
+                {selData.typeId==="porta" && selData.doorType!=="sliding" && (
                   <div style={{marginTop:2}}>
                     <SL>Dobradiça</SL>
                     <div style={{display:"flex",gap:4}}>
-                      {[["left","◁ Esquerda"],["right","Direita ▷"]].map(([side,label])=>(
+                      {[["left","◁ Esquerda"],["right","Direita ▷"]].map(([side,lbl])=>(
                         <div key={side} onClick={()=>{
-                          const obj = selRef.current;
-                          if (obj && obj.userData.doorSide !== side) toggleDoorSide();
+                          const obj=selRef.current;
+                          if(obj && obj.userData.doorSide!==side) toggleDoorSide();
                         }} style={{
                           flex:1,padding:"8px 4px",borderRadius:6,cursor:"pointer",textAlign:"center",
                           background:selData.doorSide===side?"#1a2838":"#101018",
                           border:`2px solid ${selData.doorSide===side?"#4a8aaa":"#2a2a3a"}`,
                           transition:"all 0.15s"}}>
                           <div style={{fontSize:14}}>{side==="left"?"🚪⬅":"➡🚪"}</div>
-                          <div style={{fontSize:9,color:selData.doorSide===side?"#80c0e0":"#506070",marginTop:2}}>
-                            {label}
-                          </div>
+                          <div style={{fontSize:9,color:selData.doorSide===side?"#80c0e0":"#506070",marginTop:2}}>{lbl}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Direção do deslize — só porta de correr */}
+                {selData.typeId==="porta" && selData.doorType==="sliding" && (
+                  <div style={{marginTop:2}}>
+                    <SL>Desliza para</SL>
+                    <div style={{display:"flex",gap:4}}>
+                      {[["left","⬅ Esquerda"],["right","Direita ➡"]].map(([side,lbl])=>(
+                        <div key={side} onClick={()=>{
+                          const obj=selRef.current;
+                          if(obj && obj.userData.doorSide!==side) toggleDoorSide();
+                        }} style={{
+                          flex:1,padding:"8px 4px",borderRadius:6,cursor:"pointer",textAlign:"center",
+                          background:selData.doorSide===side?"#1a2838":"#101018",
+                          border:`2px solid ${selData.doorSide===side?"#4a8aaa":"#2a2a3a"}`,
+                          transition:"all 0.15s"}}>
+                          <div style={{fontSize:14}}>{side==="left"?"⬅":"➡"}</div>
+                          <div style={{fontSize:9,color:selData.doorSide===side?"#80c0e0":"#506070",marginTop:2}}>{lbl}</div>
                         </div>
                       ))}
                     </div>
@@ -1139,7 +1369,7 @@ export default function App() {
             {/* Posição Y */}
             <S>
               <SL>Altura do Chão (cm)</SL>
-              <DI label="↑ Distância do chão" value={selData.py ?? 0} onChange={updateY}/>
+              <DI label="↑ Distância do chão" value={selData.py??0} onChange={updateY}/>
             </S>
           </>}
         </>}
@@ -1147,110 +1377,100 @@ export default function App() {
         {/* ── MATERIAL ── */}
         {tab==="mat" && <>
           {!selId && <NoSel msg="Selecione uma peça"/>}
-
-          {/* Seletor corpo/frente — só gaveta */}
-          {selData?.typeId==="gaveta" && (
-            <S>
-              <SL>Aplicar em</SL>
-              <div style={{display:"flex",gap:4}}>
-                {[["corpo","🗄 Corpo"],["frente","⬜ Frente"]].map(([k,l])=>(
-                  <div key={k} onClick={()=>setMatTarget(k)} style={{
-                    flex:1,padding:"7px 4px",borderRadius:5,cursor:"pointer",textAlign:"center",
-                    background:matTarget===k?"#1a2838":"#101018",
-                    border:`1px solid ${matTarget===k?"#3a7aaa":"#1e2030"}`,
-                    fontSize:11,color:matTarget===k?"#80b8e0":"#4a6070",transition:"all 0.12s"}}>
-                    {l}
-                  </div>
-                ))}
-              </div>
-              {matTarget==="frente" && (
-                <div style={{marginTop:6,padding:"5px 8px",background:"#0e1420",
-                  border:"1px solid #2a3a4a",borderRadius:5,fontSize:10,color:"#6090a0"}}>
-                  Cor atual da frente: <span style={{color:"#a0c8e0",fontWeight:600}}>
-                    {ALL_MAT_ITEMS.find(m=>m.id===selData.frontMatId)?.label || selData.frontMatId}
-                  </span>
+          {selData && <>
+            {/* Seletor Corpo/Frente — só gaveta */}
+            {selData.typeId==="gaveta" && (
+              <S>
+                <SL>Aplicar Material em</SL>
+                <div style={{display:"flex",gap:4,marginBottom:4}}>
+                  {[["corpo","🗄 Corpo"],["frente","⬜ Frente"]].map(([t,lbl])=>(
+                    <div key={t} onClick={()=>setMatTarget(t)} style={{
+                      flex:1,padding:"7px 4px",borderRadius:5,cursor:"pointer",textAlign:"center",
+                      background:matTarget===t?"#1a2838":"#101018",
+                      border:`2px solid ${matTarget===t?"#3a7aaa":"#2a2a3a"}`,
+                      fontSize:10,color:matTarget===t?"#80c0e0":"#506070",transition:"all 0.15s"}}>{lbl}</div>
+                  ))}
                 </div>
-              )}
+                {matTarget==="frente" && (
+                  <div style={{fontSize:10,color:"#4a8ab0",background:"#0a1828",
+                    padding:"4px 8px",borderRadius:4,border:"1px solid #1a3a5a"}}>
+                    Frente: {ALL_MAT_ITEMS.find(m=>m.id===selData.frontMatId)?.label || selData.frontMatId}
+                  </div>
+                )}
+              </S>
+            )}
+            {/* Busca */}
+            <S>
+              <SL>Buscar Material</SL>
+              <input value={matSearch} onChange={e=>setMatSearch(e.target.value)}
+                placeholder="ex: freijó, branco..." autoComplete="off"
+                style={{width:"100%",padding:"6px 8px",background:"#0a1020",
+                  border:"1px solid #2a3a5a",borderRadius:5,color:"#a0c8e0",
+                  fontSize:11,boxSizing:"border-box",outline:"none"}}/>
             </S>
-          )}
-
-          <S>
-            <SL>Buscar</SL>
-            <input placeholder="ex: Freijó, Branco, Cinza..."
-              value={matSearch} onChange={e=>setMatSearch(e.target.value)}
-              style={{width:"100%",padding:"5px 8px",borderRadius:4,background:"#090916",
-                border:"1px solid #2a3a5a",color:"#90b8e0",fontSize:11,
-                boxSizing:"border-box",outline:"none"}}/>
-          </S>
-          <div style={{overflowY:"auto",flex:1}}>
+            {/* Catálogo */}
             {MAT_GROUPS.map(g=>{
-              const items = g.items.filter(m=>
+              const filtered = g.items.filter(m=>
                 !matSearch || m.label.toLowerCase().includes(matSearch.toLowerCase())
               );
-              if (!items.length) return null;
-              const onSel = (selData?.typeId==="gaveta" && matTarget==="frente") ? applyFrontMat : applyMat;
-              const activeMid = (selData?.typeId==="gaveta" && matTarget==="frente") ? selData?.frontMatId : actMat;
-              return <S key={g.group}>
-                <SL>{g.group}</SL>
-                {items.map(m=><MI key={m.id} m={m} active={activeMid} onSel={onSel}/>)}
-              </S>;
+              if(!filtered.length) return null;
+              const activeMid = matTarget==="frente" ? selData.frontMatId : selData.matId;
+              return (
+                <S key={g.group}>
+                  <SL>{g.group}</SL>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:3}}>
+                    {filtered.map(m=>(
+                      <MI key={m.id} m={m} active={activeMid===m.id}
+                        onSel={()=>matTarget==="frente"?applyFrontMat(m.id):applyMat(m.id)}/>
+                    ))}
+                  </div>
+                </S>
+              );
             })}
-            <S>
-              <SL>Vidros</SL>
-              {(() => {
-                const onSel = (selData?.typeId==="gaveta" && matTarget==="frente") ? applyFrontMat : applyMat;
-                const activeMid = (selData?.typeId==="gaveta" && matTarget==="frente") ? selData?.frontMatId : actMat;
-                return MATS_GLASS.map(m=><MI key={m.id} m={m} active={activeMid} onSel={onSel} glass/>);
-              })()}
-            </S>
-          </div>
+            {/* Vidros */}
+            {selData.typeId==="vidro" && (
+              <S>
+                <SL>Vidros</SL>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:3}}>
+                  {MATS_GLASS.filter(m=>
+                    !matSearch||m.label.toLowerCase().includes(matSearch.toLowerCase())
+                  ).map(m=>(
+                    <MI key={m.id} m={m} active={selData.matId===m.id} glass
+                      onSel={()=>applyMat(m.id)}/>
+                  ))}
+                </div>
+              </S>
+            )}
+          </>}
         </>}
 
         {/* ── VISTA ── */}
-        {tab==="cam" && <>
+        {tab==="cam" && (
           <S>
-            <SL>Câmera</SL>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
-              {[["iso","⬡ Iso"],["top","⬆ Cima"],["front","◼ Frente"],
-                ["back","◻ Atrás"],["left","◁ Esq"],["right","▷ Dir"]].map(([v,l])=>(
-                <div key={v} onClick={()=>setView(v)} style={{padding:"7px 4px",textAlign:"center",
-                  borderRadius:5,cursor:"pointer",background:"#101020",border:"1px solid #1e2a3a",
-                  fontSize:11,color:"#6080a0",transition:"all 0.12s"}}>{l}</div>
-              ))}
+            <SL>Ângulo de Vista</SL>
+            {[["iso","⬡ Isométrica"],["top","⬆ Topo"],["front","▣ Frontal"],
+              ["back","▣ Traseira"],["left","◁ Esquerda"],["right","▷ Direita"]].map(([v,lbl])=>(
+              <PBtn key={v} onClick={()=>setView(v)} c="#1a2a3a">{lbl}</PBtn>
+            ))}
+            <SL style={{marginTop:8}}>Zoom</SL>
+            <div style={{display:"flex",gap:4}}>
+              <PBtn onClick={()=>{sph.current.radius=Math.max(0.5,sph.current.radius-0.5);updateCam();}} c="#1a2a2a">🔍 +</PBtn>
+              <PBtn onClick={()=>{sph.current.radius=Math.min(14,sph.current.radius+0.5);updateCam();}} c="#1a2a2a">🔍 −</PBtn>
             </div>
           </S>
-          <S>
-            <SL>Controles</SL>
-            <div style={{fontSize:10,color:"#445566",lineHeight:2.0}}>
-              <div>🖱 Esq → Selecionar / Mover</div>
-              <div>🖱 Dir → Orbitar câmera</div>
-              <div>🖱 Alt+Esq / Meio → Pan</div>
-              <div>🖱 Scroll → Zoom</div>
-              <div>🧲 Snap de faces automático</div>
-            </div>
-          </S>
-        </>}
+        )}
+
+        {/* ── PLANO DE CORTE + ORÇAMENTO ── */}
+        {tab==="cut" && <CutTab prices={prices} setPrices={setPrices} piecesRef={piecesRef} selFromList={selFromList} toggleLock={toggleLock}/>}
       </div>
 
       {/* ═══ VIEWPORT ═══ */}
-      <div style={{flex:1,display:"flex",flexDirection:"column",position:"relative",overflow:"hidden"}}>
-
-        {/* top bar */}
-        <div style={{height:30,background:"#0c0c18",borderBottom:"1px solid #181828",flexShrink:0,
-          display:"flex",alignItems:"center",padding:"0 14px",gap:8,fontSize:10,color:"#2a4050"}}>
-          <span style={{color:"#2a4a6a",fontSize:12}}>◈</span>
-          <span style={{color:"#3a5a6a"}}>VIEWPORT 3D</span>
-          <span style={{color:"#182028"}}>│</span>
-          <span>Dir: orbitar · Alt: pan · Scroll: zoom · Esq: selecionar/mover</span>
-          {selId && <span style={{marginLeft:"auto",color:"#3a7a5a",fontSize:11}}>✓ {selData?.label}</span>}
-        </div>
-
-        {/* canvas */}
+      <div style={{flex:1,position:"relative",display:"flex",flexDirection:"column"}}>
         <div ref={mountRef} style={{flex:1}}
           onMouseDown={onMD} onMouseMove={onMM} onMouseUp={onMU} onMouseLeave={onMU}
           onWheel={onWheel} onContextMenu={e=>e.preventDefault()}/>
 
-        {/* status */}
+        {/* Status bar */}
         <div style={{height:22,background:"#080810",borderTop:"1px solid #121222",flexShrink:0,
           display:"flex",alignItems:"center",padding:"0 14px",fontSize:10}}>
           <span style={{color:"#3a6a40",marginRight:8}}>●</span>
@@ -1272,88 +1492,99 @@ export default function App() {
 
         {/* Botões flutuantes */}
         {selId && (
-          <div style={{position:"absolute",bottom:30,right:10,display:"flex",gap:4,pointerEvents:"all",alignItems:"center"}}>
+          <div style={{position:"absolute",bottom:30,right:10,display:"flex",gap:4,
+            pointerEvents:"all",alignItems:"center"}}>
             {/* Duplicar */}
             <div onClick={dupSel} title="Duplicar peça" style={{
               width:32,height:32,borderRadius:6,background:"#0e1a10",border:"1px solid #2a5a30",
               display:"flex",alignItems:"center",justifyContent:"center",
               cursor:"pointer",fontSize:14,userSelect:"none"}}>📋</div>
-            {isMovable && <>
+            {/* Abrir/fechar — só porta/gaveta */}
+            {isMovable && (
               <div onClick={toggleOpen} style={{
                 height:32,padding:"0 10px",borderRadius:6,display:"flex",alignItems:"center",gap:5,
                 background:selData?.isOpen?"#0e2a0e":"#0e0e28",
-                border:`1px solid ${selData?.isOpen?"#2a7a2a":"#2a2a7a"}`,
-                cursor:"pointer",fontSize:11,
-                color:selData?.isOpen?"#60d060":"#6060d0",userSelect:"none"}}>
-                <span>{selData?.isOpen?"🔓":"🔒"}</span>
-                <span>{selData?.isOpen?"Fechar":"Abrir"}</span>
+                border:`1px solid ${selData?.isOpen?"#2a6a2a":"#2a2a6a"}`,
+                cursor:"pointer",fontSize:11,color:selData?.isOpen?"#70c070":"#7070c0",userSelect:"none"}}>
+                {selData?.isOpen?"🔓 Fechar":"🔒 Abrir"}
               </div>
-              <div onClick={toggleHandle} title={selData?.hasHandle?"Remover puxador":"Adicionar puxador"} style={{
-                width:32,height:32,borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",
-                background:selData?.hasHandle?"#1a1a0e":"#0e0e0e",
-                border:`1px solid ${selData?.hasHandle?"#6a5a1a":"#2a2a1a"}`,
-                cursor:"pointer",fontSize:15,userSelect:"none",
-                opacity:selData?.hasHandle?1:0.45}}>
-                🔩
-              </div>
-            </>}
-            {[["↺Y","ry",-90],["↻Y","ry",90],["↑X","rx",-90],["↓X","rx",90]].map(([l,ax,v])=>(
-              <div key={l} onClick={()=>updateRot(ax,(selData?.[ax]||0)+v)} style={{
-                width:32,height:32,borderRadius:6,background:"#0e1828",border:"1px solid #2a4060",
-                display:"flex",alignItems:"center",justifyContent:"center",
-                cursor:"pointer",fontSize:13,color:"#6090c0",userSelect:"none"}}>{l}</div>
-            ))}
+            )}
+            {/* Remover */}
+            <div onClick={delSel} title="Remover peça" style={{
+              width:32,height:32,borderRadius:6,background:"#1a0a0a",border:"1px solid #5a2a2a",
+              display:"flex",alignItems:"center",justifyContent:"center",
+              cursor:"pointer",fontSize:14,userSelect:"none"}}>🗑</div>
           </div>
         )}
+
+        {/* Legenda controles */}
+        <div style={{position:"absolute",bottom:30,left:10,pointerEvents:"none",
+          fontSize:9,color:"#2a4a3a",lineHeight:1.8}}>
+          <div>🖱 Arr. esq → mover peça</div>
+          <div>🖱 Arr. dir → orbitar câmera</div>
+          <div>🖱 Alt+arr → pan</div>
+          <div>🖱 Roda → zoom</div>
+        </div>
       </div>
     </div>
   );
 }
 
-// ─────────────────────────────────────────────
-// UI COMPONENTS
-// ─────────────────────────────────────────────
-function S({children})  { return <div style={{padding:"10px 12px 6px",borderBottom:"1px solid #141428"}}>{children}</div>; }
-function SL({children}) { return <div style={{fontSize:9,letterSpacing:2,color:"#3a5060",textTransform:"uppercase",marginBottom:5,marginTop:2}}>{children}</div>; }
+function S({children}) {
+  return (
+    <div style={{padding:"10px 12px",borderBottom:"1px solid #0e1828"}}>
+      {children}
+    </div>
+  );
+}
+
+function SL({children}) {
+  return (
+    <div style={{fontSize:9,letterSpacing:1.5,color:"#3a5a7a",textTransform:"uppercase",
+      marginBottom:5,marginTop:2}}>{children}</div>
+  );
+}
 
 function PBtn({children, onClick, c="#1e3a5a", disabled}) {
   return (
-    <div onClick={disabled?undefined:onClick} style={{
-      padding:"7px 10px",marginBottom:4,borderRadius:5,
-      cursor:disabled?"not-allowed":"pointer",
-      background:disabled?"#0e0e18":`${c}55`,
-      border:`1px solid ${disabled?"#1a1a2a":`${c}99`}`,
-      fontSize:11,color:disabled?"#3a3a4a":"#aacccc",
-      textAlign:"center",opacity:disabled?0.5:1,transition:"all 0.12s"
-    }}>{children}</div>
+    <div onClick={disabled?null:onClick} style={{
+      padding:"7px 10px",borderRadius:5,cursor:disabled?"not-allowed":"pointer",
+      background:disabled?"#0a0a14":c,border:`1px solid ${disabled?"#1a1a2a":"#2a4a6a"}`,
+      color:disabled?"#2a3a4a":"#90c0e0",fontSize:10,textAlign:"center",
+      marginBottom:4,opacity:disabled?0.5:1,userSelect:"none",transition:"all 0.12s"}}>
+      {children}
+    </div>
   );
 }
 
 function DI({label, value, onChange}) {
   return (
-    <div style={{marginBottom:6}}>
-      <div style={{fontSize:9,color:"#4a6070",marginBottom:2}}>{label}</div>
-      <input type="number" min="0" max="600" step="1" value={value}
+    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+      <div style={{fontSize:9,color:"#4a6a7a",width:90,flexShrink:0}}>{label}</div>
+      <input type="number" min={1} max={500} step={1} value={value}
         onChange={e=>onChange(e.target.value)}
-        style={{width:"100%",padding:"5px 7px",borderRadius:4,background:"#090916",
-          border:"1px solid #2a3a5a",color:"#90b8e0",fontSize:12,
-          boxSizing:"border-box",outline:"none"}}/>
+        style={{flex:1,padding:"4px 6px",background:"#080c18",border:"1px solid #2a3a5a",
+          borderRadius:4,color:"#80c0e0",fontSize:11,outline:"none",textAlign:"right"}}/>
+      <div style={{fontSize:9,color:"#3a5a7a"}}>cm</div>
     </div>
   );
 }
 
 function MI({m, active, onSel, glass}) {
-  const on = active===m.id;
   return (
-    <div onClick={()=>onSel(m.id)} style={{
-      display:"flex",alignItems:"center",gap:8,padding:"5px 8px",marginBottom:3,
-      borderRadius:5,cursor:"pointer",
-      background:on?"#141e2a":"#0e0e18",
-      border:`1px solid ${on?"#3a6080":"#1a1a28"}`,transition:"all 0.12s"}}>
-      <div style={{width:18,height:18,borderRadius:3,background:m.color,
-        border:"1px solid #ffffff18",flexShrink:0,opacity:glass?0.7:1}}/>
-      <span style={{fontSize:11,color:on?"#80b0d8":"#607080",flex:1}}>{m.label}</span>
-      {glass && <span style={{fontSize:8,color:"#3a7a9a"}}>vidro</span>}
+    <div onClick={onSel} style={{
+      display:"flex",alignItems:"center",gap:5,padding:"4px 6px",borderRadius:4,
+      cursor:"pointer",background:active?"#1a2838":"#0a0a18",
+      border:`1px solid ${active?"#3a6a9a":"#141424"}`,transition:"all 0.1s"}}>
+      <div style={{
+        width:18,height:18,borderRadius:3,flexShrink:0,
+        background:glass?"linear-gradient(135deg,#88ccff88,#ffffff44)":m.color,
+        border:`1px solid ${active?"#4a7aaa":"#2a2a3a"}`,
+        boxShadow:glass?"inset 0 0 4px #ffffff44":""}}/>
+      <div style={{fontSize:9,color:active?"#a0c8e0":"#5a7a8a",
+        overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",lineHeight:1.2}}>
+        {m.label}
+      </div>
     </div>
   );
 }
@@ -1371,5 +1602,238 @@ function NoSel({msg="Selecione uma peça na cena"}) {
   return (
     <div style={{margin:"12px",padding:"10px",background:"#0e1420",border:"1px solid #2a3a4a",
       borderRadius:6,fontSize:11,color:"#4a6070",textAlign:"center"}}>← {msg}</div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// PLANO DE CORTE — componente separado para evitar
+// criação de sub-componentes dentro do render principal
+// ─────────────────────────────────────────────
+function PriceRow({label, field, suffix, prices, setPrices}) {
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+      <div style={{fontSize:9,color:"#4a6a7a",flex:1}}>{label}</div>
+      <input type="number" step="any" min={0}
+        value={prices[field]}
+        onChange={e => setPrices(p => ({...p, [field]: parseFloat(e.target.value)||0}))}
+        style={{width:72,padding:"3px 6px",background:"#080c18",border:"1px solid #2a3a5a",
+          borderRadius:4,color:"#f0c040",fontSize:11,outline:"none",textAlign:"right"}}/>
+      <span style={{fontSize:9,color:"#3a5a7a",width:24,flexShrink:0}}>{suffix}</span>
+    </div>
+  );
+}
+
+function CutTab({prices, setPrices, piecesRef, selFromList, toggleLock}) {
+  const CW = prices.chapaW, CH = prices.chapaH;
+
+  const panels = piecesRef.current.map(o => ({
+    id:    o.userData.id,
+    label: o.userData.label || "Peça",
+    w: Math.round((o.userData.w || 0) * 1000),
+    h: Math.round((o.userData.h || 0) * 1000),
+    d: Math.round((o.userData.d || 0) * 1000),
+    mat: ALL_MAT_ITEMS.find(m=>m.id===o.userData.matId)?.label || o.userData.matId || "MDF",
+    locked: !!o.userData.locked,
+  })).filter(p => p.w > 10 && p.h > 10);
+
+  const totalM2    = panels.reduce((a,p) => a + (p.w/1000)*(p.h/1000), 0);
+  const totalPerim = panels.reduce((a,p) => a + 2*((p.w+p.h)/1000), 0);
+  const chapas     = Math.max(1, Math.ceil(totalM2 / ((CW/1000)*(CH/1000))));
+  const matCost    = totalM2 * prices.priceM2;
+  const fitaCost   = totalPerim * prices.fitaM;
+  const srrCost    = chapas * prices.corteChapa;
+  const moCost     = totalM2 * prices.moObraM2;
+  const total      = matCost + fitaCost + srrCost + moCost;
+
+  const generateReport = () => {
+    const sep1 = "═".repeat(52);
+    const sep2 = "─".repeat(52);
+    const pad  = (s,n) => String(s).padEnd(n);
+    const rpad = (s,n) => String(s).padStart(n);
+
+    const rows = panels.map((p,i) =>
+      `  ${rpad(i+1,2)}. ${pad(p.label,22)} ${rpad(p.w,4)}×${rpad(p.h,4)}×${rpad(p.d,2)}mm   ${p.mat}`
+    );
+
+    const txt = [
+      sep1,
+      "       MODELARE MARCENARIA — PLANO DE CORTE",
+      sep1,
+      `  Data: ${new Date().toLocaleDateString("pt-BR")}   |   Peças: ${panels.length}`,
+      `  Chapa padrão: ${CW}×${CH}mm`,
+      sep2,
+      "  # │ Peça                   │  L ×  A × Esp  │ Material",
+      sep2,
+      ...rows,
+      sep2,
+      "  RESUMO DE MATERIAL",
+      sep2,
+      `  Área total das peças  : ${totalM2.toFixed(4)} m²`,
+      `  Área por chapa        : ${((CW/1000)*(CH/1000)).toFixed(4)} m²`,
+      `  Chapas necessárias    : ${chapas} chapa(s) de ${CW}×${CH}mm`,
+      `  Fita de borda total   : ${totalPerim.toFixed(2)} m`,
+      sep2,
+      "  ORÇAMENTO ESTIMADO",
+      sep2,
+      `  Material MDF          : R$ ${matCost.toFixed(2)}`,
+      `  Fita de borda         : R$ ${fitaCost.toFixed(2)}`,
+      `  Corte / Serra         : R$ ${srrCost.toFixed(2)}`,
+      ...(prices.moObraM2 > 0 ? [`  Mão de obra           : R$ ${moCost.toFixed(2)}`] : []),
+      sep2,
+      `  TOTAL ESTIMADO        : R$ ${total.toFixed(2)}`,
+      sep1,
+      "  * Estimativa. Não inclui ferragens, parafusos ou acabamentos.",
+      "  * Gerado por Modelare 3D Studio",
+      sep1,
+    ].join("\n");
+
+    const blob = new Blob([txt], {type:"text/plain;charset=utf-8"});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = `plano_corte_${new Date().toISOString().slice(0,10)}.txt`;
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  const priceFields = [
+    {label:"Largura da chapa",     field:"chapaW",     suffix:"mm"},
+    {label:"Altura da chapa",      field:"chapaH",     suffix:"mm"},
+    null, // divisor
+    {label:"Material MDF (m²)",    field:"priceM2",    suffix:"R$"},
+    {label:"Fita de borda (m)",    field:"fitaM",      suffix:"R$"},
+    {label:"Corte por chapa",      field:"corteChapa", suffix:"R$"},
+    {label:"Mão de obra (m²)",     field:"moObraM2",   suffix:"R$"},
+  ];
+
+  return (
+    <>
+      {/* Configurações de preço */}
+      <S>
+        <SL>⚙ Configurações de Valores</SL>
+        <div style={{fontSize:8,color:"#405060",marginBottom:7,fontStyle:"italic",lineHeight:1.5}}>
+          Edite qualquer campo — orçamento atualiza em tempo real
+        </div>
+        {priceFields.map((f,i) =>
+          f === null
+            ? <div key={i} style={{height:1,background:"#1a2a3a",margin:"4px 0"}}/>
+            : <PriceRow key={f.field} {...f} prices={prices} setPrices={setPrices}/>
+        )}
+      </S>
+
+      {panels.length === 0
+        ? <NoSel msg="Adicione peças para gerar o plano de corte"/>
+        : <>
+            {/* Lista de peças */}
+            <S>
+              <SL>📐 Lista de Corte — {panels.length} {panels.length===1?"peça":"peças"}</SL>
+              <div style={{maxHeight:230,overflowY:"auto"}}>
+                {/* Cabeçalho */}
+                <div style={{display:"grid",gridTemplateColumns:"18px 1fr 84px 22px",gap:"0 4px",
+                  padding:"3px 4px",marginBottom:2,borderBottom:"1px solid #1a2a3a",
+                  fontSize:8,color:"#3a5a6a",fontWeight:600}}>
+                  <span>#</span><span>Peça / Material</span><span style={{textAlign:"right"}}>L×A×Esp</span><span/>
+                </div>
+                {panels.map((p,i) => (
+                  <div key={p.id} style={{
+                    display:"grid",gridTemplateColumns:"18px 1fr 84px 22px",gap:"0 4px",
+                    alignItems:"center",padding:"4px 4px",borderRadius:3,marginBottom:1,
+                    background:p.locked?"#1a0e00":i%2===0?"#0a0e18":"#080c14",
+                    borderLeft:`2px solid ${p.locked?"#cc6600":["#4a8aaa","#6a5a3a","#3a7a5a","#7a4a7a"][i%4]}`}}>
+                    <span style={{fontSize:8,color:"#3a5a7a",textAlign:"right"}}>{i+1}</span>
+                    <div>
+                      <div style={{fontSize:9,color:p.locked?"#ff9900":"#90b0d0",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontWeight:500}}>
+                        {p.locked?"🔒 ":""}{p.label}
+                      </div>
+                      <div style={{fontSize:8,color:"#3a6a5a",marginTop:1}}>{p.mat.split(" ").slice(0,3).join(" ")}</div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:10,color:"#c8a060",fontWeight:700,fontFamily:"monospace",whiteSpace:"nowrap"}}>{p.w}×{p.h}</div>
+                      <div style={{fontSize:8,color:"#4a5a6a",fontFamily:"monospace"}}>e:{p.d}</div>
+                    </div>
+                    {/* Botão de bloqueio */}
+                    <div
+                      onClick={() => { selFromList(p.id); setTimeout(toggleLock, 40); }}
+                      title={p.locked ? "Desbloquear peça" : "Bloquear peça"}
+                      style={{
+                        display:"flex",alignItems:"center",justifyContent:"center",
+                        width:20,height:20,borderRadius:4,cursor:"pointer",fontSize:12,
+                        background:p.locked?"#2a1400":"#0e1828",
+                        border:`1px solid ${p.locked?"#884400":"#1a3a4a"}`,
+                        userSelect:"none",transition:"all 0.15s"}}>
+                      {p.locked?"🔒":"🔓"}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </S>
+
+            {/* Chapas */}
+            <S>
+              <SL>🪵 Chapas Necessárias</SL>
+              <div style={{background:"#070d18",borderRadius:6,padding:"10px",border:"1px solid #1a2a3a"}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                  <span style={{fontSize:9,color:"#506070"}}>Área das peças:</span>
+                  <span style={{fontSize:9,color:"#a0c0e0",fontFamily:"monospace"}}>{totalM2.toFixed(3)} m²</span>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                  <span style={{fontSize:9,color:"#506070"}}>Por chapa ({CW}×{CH}):</span>
+                  <span style={{fontSize:9,color:"#a0c0e0",fontFamily:"monospace"}}>{((CW/1000)*(CH/1000)).toFixed(3)} m²</span>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                  background:"#0e1828",borderRadius:5,padding:"8px 10px",border:"1px solid #2a3a5a"}}>
+                  <div>
+                    <div style={{fontSize:9,color:"#608090"}}>Chapas {CW}×{CH}mm</div>
+                    <div style={{fontSize:8,color:"#405060",marginTop:1}}>+ 10% de sobra recomendado</div>
+                  </div>
+                  <div style={{fontSize:22,fontWeight:800,color:"#f0c040",fontFamily:"monospace"}}>{chapas}</div>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",marginTop:6}}>
+                  <span style={{fontSize:9,color:"#506070"}}>Fita de borda:</span>
+                  <span style={{fontSize:9,color:"#a0c0e0",fontFamily:"monospace"}}>{totalPerim.toFixed(2)} m</span>
+                </div>
+              </div>
+            </S>
+
+            {/* Orçamento */}
+            <S>
+              <SL>💰 Orçamento</SL>
+              {[
+                ["Material MDF", matCost],
+                ["Fita de borda", fitaCost],
+                ["Corte / Serra", srrCost],
+                ...(prices.moObraM2>0 ? [["Mão de obra", moCost]] : []),
+              ].map(([lbl,val]) => (
+                <div key={lbl} style={{display:"flex",justifyContent:"space-between",
+                  padding:"3px 0",borderBottom:"1px solid #0e1828"}}>
+                  <span style={{fontSize:10,color:"#607080"}}>{lbl}</span>
+                  <span style={{fontSize:10,color:"#80c080",fontFamily:"monospace"}}>R$ {val.toFixed(2)}</span>
+                </div>
+              ))}
+              <div style={{display:"flex",justifyContent:"space-between",marginTop:8,
+                padding:"6px 8px",background:"#0e1828",borderRadius:5,border:"1px solid #2a3a2a"}}>
+                <span style={{fontSize:12,color:"#c8a060",fontWeight:700}}>TOTAL</span>
+                <span style={{fontSize:14,color:"#f0c040",fontWeight:800,fontFamily:"monospace"}}>R$ {total.toFixed(2)}</span>
+              </div>
+              <div style={{fontSize:8,color:"#304050",marginTop:5,fontStyle:"italic",textAlign:"center"}}>
+                Não inclui ferragens, parafusos e acabamentos
+              </div>
+            </S>
+
+            {/* Exportar */}
+            <div style={{padding:"4px 12px 14px"}}>
+              <div onClick={generateReport} style={{
+                padding:"11px",borderRadius:7,cursor:"pointer",textAlign:"center",
+                background:"linear-gradient(135deg,#112211,#0a1a0a)",
+                border:"2px solid #2a8a3a",userSelect:"none",
+                transition:"all 0.15s"}}>
+                <div style={{fontSize:18,marginBottom:3}}>📄</div>
+                <div style={{fontSize:11,fontWeight:700,color:"#60d070",letterSpacing:0.5}}>Exportar Relatório</div>
+                <div style={{fontSize:8,color:"#3a5a40",marginTop:2}}>
+                  Baixar .txt com lista de corte completa
+                </div>
+              </div>
+            </div>
+          </>
+      }
+    </>
   );
 }
