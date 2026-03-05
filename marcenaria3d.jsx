@@ -1,12 +1,69 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                        MODELARE 3D — marcenaria3d.jsx                       ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║  Aplicativo de modelagem 3D de móveis sob medida para marcenaria.           ║
+ * ║                                                                              ║
+ * ║  Stack:                                                                      ║
+ * ║    - React 18 (hooks: useState, useEffect, useRef, useCallback)             ║
+ * ║    - Three.js r128 (WebGL renderer, geometrias, materiais, sombras)         ║
+ * ║                                                                              ║
+ * ║  Funcionalidades principais:                                                 ║
+ * ║    • Adicionar / duplicar / remover peças de marcenaria em cena 3D          ║
+ * ║    • Arrastar peças com snap de 1mm e snap magnético entre bordas            ║
+ * ║    • Editar dimensões, rotação e posição vertical de cada peça              ║
+ * ║    • Animação de abrir/fechar gavetas e portas (dobradiça e correr)         ║
+ * ║    • Catálogo completo Eucatex 2024 (52 acabamentos + 3 vidros)             ║
+ * ║    • Plano de corte automático com orçamento estimado                        ║
+ * ║    • Exportar relatório de corte em .txt                                     ║
+ * ║                                                                              ║
+ * ║  Estrutura do arquivo (ordem de declaração):                                 ║
+ * ║    1. Texturas procedurais (woodCanvas, makeTex)          linha ~10          ║
+ * ║    2. Catálogo de materiais (MAT_GROUPS, buildMat)        linha ~56          ║
+ * ║    3. Tipos de peça (PTYPES)                              linha ~148         ║
+ * ║    4. Construtores 3D (makeHandle, makeTrack, makePiece)  linha ~161         ║
+ * ║    5. Rebuild de geometria (rebuildPiece)                 linha ~299         ║
+ * ║    6. Sistema de animação (toggleOpenClose, tickAnimations) linha ~362       ║
+ * ║    7. Outline de seleção (addOutline, syncOutline)        linha ~443         ║
+ * ║    8. Sistema de snap (snapGrid, edgeSnap)                linha ~492         ║
+ * ║    9. Componente principal App                            linha ~578         ║
+ * ║   10. Componentes UI auxiliares (S, SL, PBtn, DI, MI…)   linha ~1670        ║
+ * ║   11. Aba de plano de corte (CutTab)                      linha ~1745        ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
+
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 
-// ─────────────────────────────────────────────
-// TEXTURAS — canvas cacheado + THREE.CanvasTexture cacheado na GPU
-// ─────────────────────────────────────────────
-const _canvasCache = {}; // cache do canvas 2D
-const _texCache    = {}; // cache da CanvasTexture (GPU) — evita VRAM duplicada
+// ─────────────────────────────────────────────────────────────────────────────
+// SISTEMA DE TEXTURAS
+// Estratégia de cache em dois níveis para evitar recriação desnecessária:
+//   Nível 1: _canvasCache  → canvas 2D (CPU). Gerado uma vez por tipo de madeira.
+//   Nível 2: _texCache     → THREE.CanvasTexture (GPU/VRAM). Um por tipo, compartilhado.
+// Ao criar um material, clona-se a textura do cache para ajustar o repeat
+// independentemente sem duplicar o buffer na GPU.
+// ─────────────────────────────────────────────────────────────────────────────
 
+/** @type {Object.<string, HTMLCanvasElement>} Cache de canvas 2D por tipo de madeira */
+const _canvasCache = {};
+
+/** @type {Object.<string, THREE.CanvasTexture>} Cache de CanvasTexture na GPU — evita VRAM duplicada */
+const _texCache    = {};
+
+/**
+ * Gera (ou retorna do cache) um canvas 2D com textura procedural de madeira.
+ *
+ * O algoritmo desenha:
+ *  - Fundo sólido na cor base da madeira
+ *  - 90 veios ondulados com variação aleatória de largura e opacidade
+ *  - 3 nós elípticos (exceto no tipo "branco")
+ *
+ * Tipos suportados: "freijo" | "carvalho" | "branco" | "mdf_bp" | "nogueira" | "pinus"
+ * Qualquer tipo desconhecido cai no fallback de freijó.
+ *
+ * @param {string} type - Identificador do tipo de madeira
+ * @returns {HTMLCanvasElement} Canvas 512×512px com a textura desenhada
+ */
 function woodCanvas(type) {
   if (_canvasCache[type]) return _canvasCache[type];
   const cv = document.createElement("canvas");
@@ -39,7 +96,20 @@ function woodCanvas(type) {
   _canvasCache[type] = cv; return cv;
 }
 
-// Reutiliza a mesma CanvasTexture na GPU — só atualiza repeat por material
+/**
+ * Cria (ou reutiliza do cache) uma THREE.CanvasTexture e retorna um clone leve.
+ *
+ * O clone compartilha o buffer de GPU com o original, mas tem seu próprio
+ * `repeat` — permitindo que cada material ajuste a escala da textura conforme
+ * as dimensões reais da peça sem alocar nova VRAM.
+ *
+ * Fórmula de repeat: largura/0.5 e altura/0.5 → escala 1:1 a cada 50cm.
+ *
+ * @param {string} key - Tipo de madeira (mesmo identificador de woodCanvas)
+ * @param {number} w   - Largura real da peça em metros
+ * @param {number} h   - Altura real da peça em metros
+ * @returns {THREE.CanvasTexture} Textura configurada com repeat proporcional
+ */
 function makeTex(key, w, h) {
   if (!_texCache[key]) {
     const t = new THREE.CanvasTexture(woodCanvas(key));
@@ -53,9 +123,24 @@ function makeTex(key, w, h) {
   return t;
 }
 
-// ─────────────────────────────────────────────
-// CATÁLOGO EUCATEX 2024
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// CATÁLOGO DE MATERIAIS — Eucatex 2024
+//
+// Estrutura de cada item:
+//   id     {string}  - Identificador único usado em userData.matId
+//   label  {string}  - Nome comercial exibido na interface
+//   color  {string}  - Cor HEX aplicada como tint sobre a textura
+//   tex    {string}  - Chave de textura base (veja woodCanvas)
+//
+// Os grupos espelham as linhas reais do catálogo Eucatex:
+//   BP Poro Supermatt · Lacca AD (Alto Brilho) · BP Matt Soft (Aveludado)
+//   BP Raízes · BP Matt Plus · BP Grafis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Grupos do catálogo Eucatex 2024.
+ * @type {Array<{group: string, items: Array<{id:string, label:string, color:string, tex:string}>}>}
+ */
 const MAT_GROUPS = [
   { group:"BP Poro Supermatt", items:[
     {id:"ps_freijo",      label:"Louro Freijó",       color:"#8B5E3C", tex:"freijo"},
@@ -123,14 +208,32 @@ const MAT_GROUPS = [
   ]},
 ];
 
+/** Materiais de vidro disponíveis apenas para peças do tipo "vidro". */
 const MATS_GLASS = [
   {id:"vidro_c", label:"Vidro Cristal", color:"#a8d8ea"},
   {id:"vidro_f", label:"Vidro Fumê",    color:"#4a6070"},
   {id:"vidro_e", label:"Vidro Espelho", color:"#c8d8e0"},
 ];
 
+/** Lista plana com todos os itens de MAT_GROUPS — usada para lookups rápidos por id. */
 const ALL_MAT_ITEMS = MAT_GROUPS.flatMap(g=>g.items);
 
+/**
+ * Instancia um THREE.Material correspondente ao matId informado.
+ *
+ * Para vidros usa MeshPhysicalMaterial com transparência e metalness variáveis.
+ * Para madeiras/laminados usa MeshStandardMaterial com textura procedural (makeTex)
+ * e tint de cor conforme o catálogo.
+ *
+ * ⚠️  Cada chamada cria um novo material — o chamador é responsável por
+ *     descartar o material anterior (material.map.dispose() + material.dispose())
+ *     antes de substituí-lo para evitar memory leak na GPU.
+ *
+ * @param {string} matId - ID do material (ex: "ps_freijo", "vidro_c")
+ * @param {number} w     - Largura da peça em metros (usado para escala da textura)
+ * @param {number} h     - Altura da peça em metros (usado para escala da textura)
+ * @returns {THREE.Material} Material pronto para ser atribuído a um Mesh
+ */
 function buildMat(matId, w, h) {
   if (matId==="vidro_c") return new THREE.MeshPhysicalMaterial({color:0xa8d8ea,transparent:true,opacity:0.28,roughness:0.05,metalness:0.1,side:THREE.DoubleSide});
   if (matId==="vidro_f") return new THREE.MeshPhysicalMaterial({color:0x4a6070,transparent:true,opacity:0.42,roughness:0.05,metalness:0.15,side:THREE.DoubleSide});
@@ -142,9 +245,24 @@ function buildMat(matId, w, h) {
   return mat;
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // TIPOS DE PEÇA
-// ─────────────────────────────────────────────
+//
+// Define as dimensões padrão (em metros) de cada tipo ao ser adicionado.
+// O usuário pode alterar livremente via painel "Editar" após a criação.
+//
+// Campos:
+//   id    {string}  - Identificador interno (usado em userData.typeId)
+//   label {string}  - Nome exibido na interface
+//   icon  {string}  - Emoji/símbolo para o botão de seleção
+//   w     {number}  - Largura padrão em metros
+//   h     {number}  - Altura padrão em metros
+//   d     {number}  - Profundidade padrão em metros
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @type {Array<{id:string, label:string, icon:string, w:number, h:number, d:number}>}
+ */
 const PTYPES = [
   {id:"lateral",    label:"Lateral",    icon:"▯",  w:0.018, h:0.80,  d:0.40},
   {id:"tampo",      label:"Tampo/Base", icon:"⬜", w:0.80,  h:0.018, d:0.40},
@@ -155,9 +273,26 @@ const PTYPES = [
   {id:"vidro",      label:"Vidro",      icon:"🔲", w:0.36,  h:0.60,  d:0.006},
 ];
 
-// ─────────────────────────────────────────────
-// PUXADOR (retorna THREE.Group)
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTRUTORES DE OBJETOS 3D AUXILIARES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Cria um puxador/maçaneta metálico como THREE.Group.
+ *
+ * Geometria composta por:
+ *  - Barra cilíndrica horizontal (55% da largura da peça, máx 18cm)
+ *  - 2 suportes verticais nas extremidades da barra
+ *  - 2 rosetas circulares decorativas nos pontos de fixação
+ *
+ * O grupo é posicionado na face frontal da peça (Z = pD/2 + offset).
+ * userData.isHandle = true permite identificá-lo na hierarquia do Group.
+ *
+ * @param {number} pW - Largura da peça-pai em metros
+ * @param {number} pH - Altura da peça-pai em metros (não utilizado diretamente, reservado)
+ * @param {number} pD - Profundidade da peça-pai em metros
+ * @returns {THREE.Group} Grupo com todos os meshes do puxador
+ */
 function makeHandle(pW, pH, pD) {
   const g = new THREE.Group();
   g.userData.isHandle = true;
@@ -184,9 +319,22 @@ function makeHandle(pW, pH, pD) {
   return g;
 }
 
-// ─────────────────────────────────────────────
-// CANALETAS (trilhos) para porta de correr
-// ─────────────────────────────────────────────
+/**
+ * Cria as canaletas (trilhos) de uma porta de correr como THREE.Group.
+ *
+ * Composto por:
+ *  - Trilho superior e inferior (barras metálicas ligeiramente mais largas que a porta)
+ *  - Canal guia rebaixado em cada trilho (visualmente indica o encaixe)
+ *
+ * Visibilidade controlada externamente: por padrão hidden (porta de abrir).
+ * Exibido somente quando userData.doorType === "sliding".
+ * userData.isTrack = true permite localizá-lo na hierarquia do Group.
+ *
+ * @param {number} pW - Largura da porta em metros
+ * @param {number} pH - Altura da porta em metros
+ * @param {number} pD - Profundidade da porta em metros (não utilizado, reservado)
+ * @returns {THREE.Group} Grupo com os 4 meshes dos trilhos
+ */
 function makeTrack(pW, pH, pD) {
   const g = new THREE.Group();
   g.userData.isTrack = true;
@@ -219,10 +367,51 @@ function makeTrack(pW, pH, pD) {
   [top, bot, chanTop, chanBot].forEach(m => g.add(m));
   return g;
 }
-// ID único seguro: baseado em timestamp — evita colisão ao recarregar
+/**
+ * Contador global de IDs de peças.
+ * Inicializado com Date.now() para evitar colisão de IDs ao recarregar a página
+ * (se fosse um simples 0,1,2... os IDs repetiriam entre sessões).
+ * @type {number}
+ */
 let GID = Date.now();
-const animSet = new Set(); // peças em animação
 
+/**
+ * Conjunto de peças que possuem animação em andamento (abertura/fechamento).
+ * Percorrido a cada frame em tickAnimations(). Usar Set evita duplicatas.
+ * @type {Set<THREE.Object3D>}
+ */
+const animSet = new Set();
+
+/**
+ * Instancia uma peça de marcenaria na cena 3D.
+ *
+ * Peças simples (lateral, tampo, fundo, prateleira, vidro) → THREE.Mesh
+ * Peças com puxador (porta, gaveta)                        → THREE.Group
+ *
+ * Estrutura do Group para gaveta:
+ *   ├── body  (Mesh, userData.isBody)    — caixa principal recuada
+ *   ├── front (Mesh, userData.isFront)   — painel frontal destacado
+ *   └── handle (Group, userData.isHandle) — puxador metálico
+ *
+ * Estrutura do Group para porta:
+ *   ├── body   (Mesh, userData.isBody)    — painel da porta
+ *   ├── track  (Group, userData.isTrack)  — canaletas (hidden por padrão)
+ *   └── handle (Group, userData.isHandle) — puxador metálico
+ *
+ * userData completo de qualquer peça:
+ *   id, typeId, matId, frontMatId (gaveta), w, h, d,
+ *   rx, ry, rz (rotação em graus),
+ *   label, locked, hasHandle,
+ *   isOpen, openProgress, baseX, baseZ, baseRY (animação),
+ *   doorSide ("left"|"right"), doorType ("hinged"|"sliding")
+ *
+ * @param {string} typeId - ID do tipo de peça (ver PTYPES)
+ * @param {string} matId  - ID do material inicial
+ * @param {number} [x=0]  - Posição X inicial em metros
+ * @param {number} [y=0]  - Posição Y da base (borda inferior) em metros
+ * @param {number} [z=0]  - Posição Z inicial em metros
+ * @returns {THREE.Mesh|THREE.Group} Objeto 3D pronto para adicionar à cena
+ */
 function makePiece(typeId, matId, x=0, y=0, z=0) {
   const tp = PTYPES.find(t=>t.id===typeId) || PTYPES[0];
   // Fix: usa string vazia como fallback para evitar crash em startsWith
@@ -296,6 +485,19 @@ function makePiece(typeId, matId, x=0, y=0, z=0) {
   return mesh;
 }
 
+/**
+ * Reconstrói a geometria e os materiais de uma peça existente na cena,
+ * aplicando as dimensões e matId atuais em userData.
+ *
+ * Chamado sempre que o usuário altera largura, altura, profundidade ou material.
+ * Garante o descarte correto (dispose) de geometrias e materiais anteriores —
+ * incluindo o map (textura clonada) — para evitar memory leak na GPU.
+ *
+ * Para Groups reconstrói também o puxador e as canaletas.
+ * Ao final, reaplica a rotação armazenada em userData (rx/ry/rz em graus).
+ *
+ * @param {THREE.Mesh|THREE.Group} obj - A peça a ser reconstruída
+ */
 function rebuildPiece(obj) {
   const {w,h,d,matId,frontMatId,typeId,rx,ry,rz} = obj.userData;
   if (obj.isGroup) {
@@ -359,9 +561,29 @@ function rebuildPiece(obj) {
   );
 }
 
-// ─────────────────────────────────────────────
-// ANIMAÇÃO ABRIR / FECHAR
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SISTEMA DE ANIMAÇÃO — abertura e fechamento de gavetas e portas
+//
+// Funcionamento:
+//   1. toggleOpenClose() inverte isOpen e adiciona o objeto ao animSet
+//   2. tickAnimations() é chamado a cada frame; avança openProgress (0→1 ou 1→0)
+//      usando interpolação exponencial suave (ease-out)
+//   3. Ao atingir o alvo (< 0.003 de diferença), remove do animSet e fixa posição
+//
+// Tipos de movimento:
+//   gaveta   → translação em Z (desliza para frente 85% da profundidade)
+//   porta hinged → rotação de 105° com pivô na borda (esq ou dir) via applyDoorTransform
+//   porta sliding → translação em X pela largura da porta
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Alterna o estado aberto/fechado de uma gaveta ou porta.
+ *
+ * Salva a posição base (baseX, baseZ, baseRY) apenas quando a peça está
+ * fechada — preserva a referência correta para a animação de retorno.
+ *
+ * @param {THREE.Group} obj - A peça (deve ser gaveta ou porta)
+ */
 function toggleOpenClose(obj) {
   if (!obj?.userData) return;
   const {typeId} = obj.userData;
@@ -376,6 +598,21 @@ function toggleOpenClose(obj) {
   animSet.add(obj);
 }
 
+/**
+ * Aplica a transformação de posição e rotação de uma porta de dobradiça
+ * para um dado progresso de abertura.
+ *
+ * A porta gira 105° em torno da sua borda (pivô).
+ * O pivô é calculado com base em doorSide:
+ *   "right" → pivô em baseX + w/2 (borda direita)
+ *   "left"  → pivô em baseX - w/2 (borda esquerda)
+ *
+ * Translação X e Z são recalculadas a cada frame para manter o pivô fixo
+ * durante a rotação (evita o efeito de "escorregar").
+ *
+ * @param {THREE.Group} obj      - O objeto porta
+ * @param {number}      progress - Valor entre 0 (fechada) e 1 (aberta)
+ */
 function applyDoorTransform(obj, progress) {
   const ud = obj.userData;
   const hw = ud.w / 2;
@@ -400,6 +637,17 @@ function applyDoorTransform(obj, progress) {
   }
 }
 
+/**
+ * Avança todas as animações ativas em um frame.
+ * Deve ser chamado dentro do loop de renderização com o delta de tempo real.
+ *
+ * Usa interpolação exponencial: progress += (target - progress) * fator
+ * O fator é limitado a 0.18 para evitar saltos em frames longos (tab inativa).
+ *
+ * Remove automaticamente do animSet quando a animação converge (Δ < 0.003).
+ *
+ * @param {number} dt - Delta de tempo desde o último frame em segundos
+ */
 function tickAnimations(dt) {
   for (const obj of animSet) {
     const ud = obj.userData;
@@ -440,11 +688,30 @@ function tickAnimations(dt) {
   }
 }
 
-// ─────────────────────────────────────────────
-// OUTLINE DE SELEÇÃO — usa dimensões do userData para evitar flicker
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// OUTLINE DE SELEÇÃO
+//
+// Contorno azul (ou laranja se bloqueada) exibido ao redor da peça selecionada.
+// Implementado como THREE.LineSegments com EdgesGeometry.
+//
+// Estratégia anti-flicker para grupos (porta/gaveta):
+//   Usa as dimensões de userData (w/h/d) em vez de calcular bounding box
+//   a cada frame — evita oscilação causada pelo movimento dos filhos (puxador).
+//
+// renderOrder = 999 e depthTest = false garantem que o contorno fique
+// sempre visível mesmo atrás de outras peças.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Chave usada em userData para identificar o objeto de outline na cena. */
 const OUTLINE_TAG = "__outline__";
 
+/**
+ * Calcula o tamanho e centro do bounding box para fins de outline.
+ * Adiciona 8mm de margem em todas as dimensões para o contorno não colar na peça.
+ *
+ * @param {THREE.Object3D} obj
+ * @returns {{size: THREE.Vector3, center: THREE.Vector3}}
+ */
 function getOutlineBox(obj) {
   // Para grupos (porta/gaveta) usa dimensões do userData — tamanho fixo, sem flicker
   if (obj.isGroup && obj.userData.w) {
@@ -459,6 +726,13 @@ function getOutlineBox(obj) {
   return { size, center };
 }
 
+/**
+ * Cria e adiciona o outline de seleção na cena para o objeto informado.
+ * Remove qualquer outline anterior antes de criar o novo.
+ *
+ * @param {THREE.Object3D} obj   - Peça selecionada
+ * @param {THREE.Scene}    scene - Cena Three.js
+ */
 function addOutline(obj, scene) {
   clearOutline(scene);
   const { size, center } = getOutlineBox(obj);
@@ -472,11 +746,23 @@ function addOutline(obj, scene) {
   scene.add(ol);
 }
 
+/**
+ * Remove o outline atual da cena e descarta geometria/material.
+ * @param {THREE.Scene} scene
+ */
 function clearOutline(scene) {
   const ol = scene.children.find(c=>c.userData[OUTLINE_TAG]);
   if (ol) { ol.geometry.dispose(); ol.material.dispose(); scene.remove(ol); }
 }
 
+/**
+ * Atualiza apenas a posição do outline existente para seguir o objeto.
+ * Usado durante drag e movimentação vertical (não recria a geometria).
+ * Para redimensionamento use addOutline() que recria com o tamanho correto.
+ *
+ * @param {THREE.Object3D} obj   - Peça sendo movida
+ * @param {THREE.Scene}    scene - Cena Three.js
+ */
 function syncOutline(obj, scene) {
   const ol = scene.children.find(c=>c.userData[OUTLINE_TAG]);
   if (!ol) return;
@@ -489,13 +775,39 @@ function syncOutline(obj, scene) {
   }
 }
 
-// ─────────────────────────────────────────────
-// SNAP — grade de 1mm + snap magnético entre peças (estilo SketchUp)
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SISTEMA DE SNAP E POSICIONAMENTO
+//
+// Dois mecanismos independentes:
+//
+//  1. snapGrid — arredonda para múltiplos de GRID (1mm).
+//     Aplicado somente ao SOLTAR o mouse (onMU), não durante o drag,
+//     para garantir movimento suave e precisão final simultâneos.
+//
+//  2. edgeSnap — snap magnético entre bordas de peças adjacentes.
+//     Detecta em X, Y e Z: borda→borda (encaixe flush) e centro→centro (alinhamento).
+//     Alcance magnético: SNAP_MAG = 6cm. Aplicado durante o drag.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Resolução da grade de posicionamento em metros (0.001 = 1mm). */
 const GRID = 0.001;
+
+/**
+ * Arredonda um valor para o múltiplo mais próximo da grade.
+ * @param {number} v - Valor em metros
+ * @param {number} [g=GRID] - Tamanho da célula da grade
+ * @returns {number} Valor arredondado
+ */
 function snapGrid(v, g=GRID) { return Math.round(v/g)*g; }
 
-// Retorna Box3 usando userData.w/h/d (sem percorrer geometrias — muito mais leve)
+/**
+ * Calcula o bounding box AABB de uma peça usando userData.w/h/d.
+ * Muito mais performático que THREE.Box3.setFromObject() pois não
+ * percorre a hierarquia de geometrias — usa as dimensões declaradas.
+ *
+ * @param {THREE.Object3D} obj
+ * @returns {THREE.Box3}
+ */
 function fastBox(obj) {
   const {w=0.1, h=0.1, d=0.1} = obj.userData;
   const p = obj.position;
@@ -505,10 +817,26 @@ function fastBox(obj) {
   );
 }
 
-// Snap magnético entre bordas de peças em X, Y e Z — estilo SketchUp
-// Detecta: borda-a-borda (encaixe), centro-a-centro (alinhamento)
-const SNAP_MAG = 0.06; // 6cm de alcance magnético
+/** Distância máxima de atração do snap magnético em metros (0.06 = 6cm). */
+const SNAP_MAG = 0.06;
 
+/**
+ * Aplica snap magnético entre a peça em movimento e todas as outras na cena.
+ *
+ * Para cada eixo (X, Y, Z) calcula 3 deltas por peça estática:
+ *   - borda direita de moving → borda esquerda de other  (encaixe)
+ *   - borda esquerda de moving → borda direita de other  (encaixe)
+ *   - centro de moving → centro de other                 (alinhamento)
+ *
+ * O menor delta dentro do raio SNAP_MAG vence e é aplicado, arrastando
+ * a peça para a posição exata de encaixe ou alinhamento.
+ *
+ * Snap em Y usa precisão de 1mm (round 1000) em vez de snapGrid
+ * para não interferir com o plano de drag (que é fixo em Y).
+ *
+ * @param {THREE.Object3D}   moving - Peça sendo arrastada
+ * @param {THREE.Object3D[]} others - Todas as peças da cena (inclui a própria)
+ */
 function edgeSnap(moving, others) {
   const {w:mw=0.1, h:mh=0.1, d:md=0.1} = moving.userData;
   const px = moving.position.x;
@@ -559,9 +887,22 @@ function edgeSnap(moving, others) {
   if (bestZ !== null) moving.position.z = snapGrid(moving.position.z - bestZ);
 }
 
-// ─────────────────────────────────────────────
-// RESOLVE HIT → top-level piece
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// RAYCASTING HELPER
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Dado um objeto interceptado pelo raycaster (que pode ser um filho interno
+ * de um Group — ex: o body ou o puxador de uma gaveta), sobe na hierarquia
+ * pai a pai até encontrar o objeto raiz que está registrado em `pieces`.
+ *
+ * Necessário porque THREE.Raycaster.intersectObjects com `recursive=true`
+ * retorna o mesh mais interno, mas a lógica de seleção precisa da peça raiz.
+ *
+ * @param {THREE.Object3D}   hitObj - Objeto retornado pelo raycaster
+ * @param {THREE.Object3D[]} pieces - Array de peças raiz registradas na cena
+ * @returns {THREE.Object3D|null} A peça raiz, ou null se não encontrada
+ */
 function resolveHit(hitObj, pieces) {
   // Walk up to find a piece in our list
   let o = hitObj;
@@ -572,45 +913,125 @@ function resolveHit(hitObj, pieces) {
   return null;
 }
 
-// ─────────────────────────────────────────────
-// APP
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPONENTE PRINCIPAL — App
+//
+// Responsável por:
+//   • Inicializar e gerenciar o ciclo de vida do Three.js (useEffect)
+//   • Gerenciar estado React (peças, seleção, aba ativa, preços)
+//   • Processar eventos de mouse (drag, órbita, pan, zoom, clique)
+//   • Expor callbacks para todas as ações de edição (add, delete, dup, etc.)
+//   • Renderizar a sidebar com abas e o viewport 3D
+//
+// Separação de estado:
+//   useRef  → estado Three.js (cena, câmera, renderer, peças 3D, drag)
+//             Mutações não causam re-render — correto para objetos 3D
+//   useState → estado React (lista de peças para UI, seleção, aba, preços)
+//             Causam re-render quando alterados
+// ─────────────────────────────────────────────────────────────────────────────
+
 export default function App() {
+  // ── Refs Three.js ────────────────────────────────────────────────────────
+  /** Elemento DOM onde o canvas do renderer é montado */
   const mountRef   = useRef(null);
+  /** THREE.Scene principal */
   const sceneRef   = useRef(null);
+  /** THREE.PerspectiveCamera */
   const cameraRef  = useRef(null);
+  /** THREE.WebGLRenderer */
   const rendRef    = useRef(null);
+  /** Array de todas as peças 3D na cena (THREE.Mesh ou THREE.Group) */
   const piecesRef  = useRef([]);
+  /** Referência à peça atualmente selecionada (ou null) */
   const selRef     = useRef(null);
 
+  // ── Refs de câmera (coordenadas esféricas) ───────────────────────────────
+  /**
+   * Estado da câmera em coordenadas esféricas.
+   * theta = azimute, phi = elevação, radius = distância, cx/cy/cz = alvo
+   */
   const sph    = useRef({theta:0.8, phi:0.65, radius:3.5, cx:0, cy:0.4, cz:0});
+  /** Estado do arrasto de órbita (botão direito) */
   const orbit  = useRef({on:false, lx:0, ly:0});
+  /** Estado do arrasto de pan (Alt + botão esquerdo) */
   const panS   = useRef({on:false, lx:0, ly:0});
+  /** Estado do arrasto de peça (botão esquerdo sobre peça) */
   const dragS  = useRef({on:false, ox:0, oz:0});
+  /**
+   * Plano horizontal usado para calcular a posição do mouse em 3D durante drag.
+   * Normal = (0,1,0), posicionado na altura Y da peça sendo arrastada.
+   */
   const dplane = useRef(new THREE.Plane(new THREE.Vector3(0,1,0), 0));
+  /** THREE.Raycaster reutilizado a cada evento de mouse (evita alocações) */
   const rc     = useRef(new THREE.Raycaster());
 
+  // ── Estado React ─────────────────────────────────────────────────────────
+  /** Lista espelho das peças para a UI (id, label, typeId, locked) */
   const [pieces,    setPieces]    = useState([]);
+  /** ID da peça selecionada (userData.id), ou null */
   const [selId,     setSelId]     = useState(null);
+  /** Cópia dos userData da peça selecionada para os controles da sidebar */
   const [selData,   setSelData]   = useState(null);
+  /** Material ativo para novos adicionar e para aplicar na seleção */
   const [actMat,    setActMat]    = useState("ps_freijo");
+  /** Tipo de peça ativo para o botão "Adicionar" */
   const [actType,   setActType]   = useState("lateral");
+  /** Aba ativa da sidebar: "add" | "edit" | "mat" | "cam" | "cut" */
   const [tab,       setTab]       = useState("add");
+  /** Mensagem exibida na barra de status inferior do viewport */
   const [status,    setStatus]    = useState("Bem-vindo! Adicione peças para montar seu móvel.");
+  /** Texto de busca no catálogo de materiais */
   const [matSearch, setMatSearch] = useState("");
-  const [matTarget, setMatTarget] = useState("corpo"); // "corpo" | "frente"
+  /** Alvo de aplicação de material na gaveta: "corpo" | "frente" */
+  const [matTarget, setMatTarget] = useState("corpo");
+  /** ID da peça com campo de renomear ativo, ou null */
   const [editingId,   setEditingId]   = useState(null);
+  /** Texto digitado no campo de renomear */
   const [editingName, setEditingName] = useState("");
+  /** Ref para o input de renomear (para focar automaticamente) */
   const renameRef = useRef(null);
 
-  // Preços editáveis globalmente
+  /**
+   * Configurações de preço para o orçamento do plano de corte.
+   * Todos os valores são editáveis pelo usuário na aba "cut".
+   * chapaW/chapaH: dimensões da chapa padrão em mm
+   * priceM2: custo do MDF por m²
+   * fitaM: custo da fita de borda por metro
+   * corteChapa: custo de corte por chapa
+   * moObraM2: mão de obra por m² (0 = não incluir)
+   */
   const [prices, setPrices] = useState({
     chapaW: 2750, chapaH: 1850,
     priceM2: 145, fitaM: 0.85, corteChapa: 18, moObraM2: 0,
   });
-  const [colisionOn, setColisionOn] = useState(false); // colisão entre peças
 
-  // ── INIT THREE.JS ──────────────────────────────────────────────
+  /** Quando true, peças não se atravessam durante o drag (colisão AABB) */
+  const [colisionOn, setColisionOn] = useState(false);
+
+  // ── INICIALIZAÇÃO DO THREE.JS ─────────────────────────────────────────────
+  /**
+   * Inicializa toda a infraestrutura Three.js uma única vez na montagem do componente.
+   * Configura: Scene, Camera, WebGLRenderer, iluminação, piso, grade e loop de animação.
+   *
+   * Configurações de renderização:
+   *   - Antialiasing ativo
+   *   - PixelRatio limitado a 2× (evita sobrecarga em telas de alta densidade)
+   *   - Sombras PCFSoft (suaves, boa performance)
+   *   - ToneMapping ACESFilmic (contraste cinematográfico)
+   *
+   * Iluminação:
+   *   - AmbientLight quente (0xfff8f0) para fill geral
+   *   - DirectionalLight principal (sol) com sombras 2048×2048
+   *   - DirectionalLight de preenchimento lateral frio (0xc0d8ff)
+   *
+   * Loop de animação:
+   *   - Calcula dt real (limitado a 50ms para evitar saltos em tabs inativas)
+   *   - Chama tickAnimations(dt) para gavetas/portas
+   *   - Sincroniza posição do outline com a peça selecionada
+   *
+   * Cleanup: cancela o requestAnimationFrame, remove o listener de resize
+   * e chama renderer.dispose() ao desmontar o componente.
+   */
   useEffect(() => {
     const mount = mountRef.current;
     const W = mount.clientWidth, H = mount.clientHeight;
@@ -688,7 +1109,12 @@ export default function App() {
     };
   }, []);
 
-  // ── CAMERA ────────────────────────────────────────────────────
+  // ── CÂMERA ────────────────────────────────────────────────────────────────
+  /**
+   * Recalcula e aplica a posição da câmera a partir das coordenadas esféricas em sph.
+   * Chamado após qualquer mudança de órbita, pan ou zoom.
+   * Fórmula: posição cartesiana = centro + esfera(theta, phi, radius)
+   */
   const updateCam = useCallback(() => {
     const {theta, phi, radius, cx, cy, cz} = sph.current;
     const cam = cameraRef.current;
@@ -700,7 +1126,16 @@ export default function App() {
     cam.lookAt(cx, cy, cz);
   }, []);
 
-  // ── SELECT ────────────────────────────────────────────────────
+  // ── SELEÇÃO ───────────────────────────────────────────────────────────────
+  /**
+   * Seleciona uma peça: atualiza selRef, cria o outline e sincroniza o estado React.
+   * Passar null desseleciona tudo.
+   *
+   * Cor do outline: laranja (0xff8800) se bloqueada, azul (0x44aaff) se livre.
+   * selData é uma cópia dos userData com py calculado em cm (base do chão).
+   *
+   * @param {THREE.Object3D|null} obj - Peça a selecionar, ou null para desselecionar
+   */
   const selectObj = useCallback((obj) => {
     selRef.current = obj;
     if (!obj) {
@@ -729,7 +1164,15 @@ export default function App() {
     setStatus(ud.locked ? `🔒 ${ud.label} (bloqueada)` : `✓ ${ud.label}`);
   }, []);
 
-  // ── NDC ───────────────────────────────────────────────────────
+  // ── COORDENADAS NDC ───────────────────────────────────────────────────────
+  /**
+   * Converte um evento de mouse para coordenadas NDC (Normalized Device Coordinates).
+   * NDC: x e y entre -1 e +1, origem no centro do canvas.
+   * Necessário para alimentar o THREE.Raycaster.
+   *
+   * @param {MouseEvent} e
+   * @returns {THREE.Vector2}
+   */
   const getNDC = useCallback((e) => {
     const r = mountRef.current.getBoundingClientRect();
     return new THREE.Vector2(
@@ -738,7 +1181,16 @@ export default function App() {
     );
   }, []);
 
-  // ── MOUSE DOWN ────────────────────────────────────────────────
+  // ── EVENTOS DE MOUSE ──────────────────────────────────────────────────────
+  /**
+   * mousedown: distribui o evento para órbita, pan ou drag de peça.
+   *
+   * Botão direito  → inicia órbita de câmera
+   * Botão do meio ou Alt+esquerdo → inicia pan de câmera
+   * Botão esquerdo → raycasting; se bater em peça: seleciona e inicia drag
+   *                  (salva offset entre posição da peça e ponto do plano de drag)
+   *                  Peças bloqueadas são selecionadas mas não arrastadas.
+   */
   const onMD = useCallback((e) => {
     if (e.button === 2) { orbit.current = {on:true, lx:e.clientX, ly:e.clientY}; return; }
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
@@ -772,7 +1224,15 @@ export default function App() {
     }
   }, [getNDC, selectObj]);
 
-  // ── MOUSE MOVE ────────────────────────────────────────────────
+  /**
+   * mousemove: processa órbita, pan ou drag de peça conforme o estado ativo.
+   *
+   * Órbita: ajusta theta (horizontal) e phi (vertical, clampado 0.06–1.54)
+   * Pan: desloca o alvo da câmera no plano da vista (direita × cima)
+   * Drag: projeta o mouse no plano horizontal (dplane), aplica offset salvo no
+   *       mousedown, aplica edgeSnap e, se colisão ativa, reverte se colidir.
+   *       O movimento é livre (sem snapGrid) para suavidade máxima.
+   */
   const onMM = useCallback((e) => {
     if (orbit.current.on) {
       const dx = e.clientX - orbit.current.lx, dy = e.clientY - orbit.current.ly;
@@ -825,6 +1285,15 @@ export default function App() {
     }
   }, [getNDC, updateCam]);
 
+  /**
+   * mouseup / mouseleave: finaliza qualquer arrasto ativo.
+   *
+   * Ao soltar uma peça:
+   *   - Aplica snapGrid(1mm) na posição final (X e Z)
+   *   - Atualiza baseX/baseZ/baseRY para a animação de abrir/fechar
+   *   - Se a peça estava aberta, força fechamento imediato
+   *   - Atualiza py no selData (pode ter mudado via snap vertical)
+   */
   const onMU = useCallback(() => {
     if (dragS.current.on && selRef.current) {
       const obj = selRef.current;
@@ -856,13 +1325,23 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * wheel: controla o zoom ajustando o raio da câmera esférica.
+   * Raio limitado entre 0.5m (muito perto) e 14m (visão geral).
+   */
   const onWheel = useCallback((e) => {
     e.preventDefault();
     sph.current.radius = Math.max(0.5, Math.min(14, sph.current.radius + e.deltaY * 0.004));
     updateCam();
   }, [updateCam]);
 
-  // ── ADD PIECE ─────────────────────────────────────────────────
+  // ── AÇÕES DE PEÇA ─────────────────────────────────────────────────────────
+  /**
+   * Adiciona uma nova peça do tipo e material ativos (actType, actMat).
+   * Posição inicial aleatória dentro de ±40cm do centro, alinhada à grade de 1mm.
+   * Garante que peças de vidro só recebem materiais de vidro.
+   * Seleciona automaticamente a peça recém-criada.
+   */
   const addPiece = useCallback(() => {
     const x = snapGrid((Math.random()-0.5)*0.8);
     const z = snapGrid((Math.random()-0.5)*0.8);
@@ -878,7 +1357,13 @@ export default function App() {
     setStatus(`➕ ${obj.userData.label} adicionado`);
   }, [actMat, actType, selectObj]);
 
-  // ── DELETE ────────────────────────────────────────────────────
+  /**
+   * Remove a peça selecionada da cena e libera toda a memória associada.
+   *
+   * Percorre a hierarquia com traverse() para descartar geometry, material.map
+   * e material de cada Mesh filho — evita memory leak na GPU após remoção.
+   * Remove também do piecesRef (Three.js) e do pieces state (React).
+   */
   const delSel = useCallback(() => {
     const obj = selRef.current; if (!obj) return;
     clearOutline(sceneRef.current);
@@ -902,7 +1387,15 @@ export default function App() {
     setStatus("🗑 Peça removida");
   }, [selectObj]);
 
-  // ── DUPLICATE ─────────────────────────────────────────────────
+  /**
+   * Duplica a peça selecionada, copiando todas as dimensões, materiais,
+   * rotação, puxador e demais propriedades do userData.
+   *
+   * A cópia é deslocada +2mm em X e Z para ficar visível imediatamente.
+   * A posição Y é preservada calculando a base (borda inferior) da original
+   * via `position.y - h/2`, evitando que Groups fiquem semienterrados.
+   * A geometria é reconstruída via rebuildPiece() com as dimensões copiadas.
+   */
   const dupSel = useCallback(() => {
     const src = selRef.current; if (!src) return;
     const ud = src.userData;
@@ -953,7 +1446,16 @@ export default function App() {
     setStatus(`📋 ${copy.userData.label}`);
   }, [selectObj]);
 
-  // ── UPDATE DIM ────────────────────────────────────────────────
+  /**
+   * Atualiza uma dimensão (w, h ou d) da peça selecionada.
+   *
+   * Converte o valor de cm para metros, aplica o mínimo de 1mm (0.001m),
+   * atualiza userData e chama rebuildPiece() para recriar a geometria.
+   * Usa addOutline() (não syncOutline) para recriar o contorno com o novo tamanho.
+   *
+   * @param {"w"|"h"|"d"} axis  - Eixo da dimensão a alterar
+   * @param {string|number} valCm - Valor em centímetros
+   */
   const updateDim = useCallback((axis, valCm) => {
     const obj = selRef.current; if (!obj) return;
     const v = Math.max(0.1, parseFloat(valCm) || 1) / 100;
@@ -968,7 +1470,17 @@ export default function App() {
     setStatus(`📐 ${axis.toUpperCase()}: ${Math.round(v*100)}cm`);
   }, []);
 
-  // ── UPDATE ROT ────────────────────────────────────────────────
+  /**
+   * Atualiza a rotação de um eixo da peça selecionada.
+   *
+   * Normaliza o ângulo para o intervalo [-180°, +180°] usando a fórmula:
+   *   `((deg % 360) + 540) % 360 - 180`
+   * Salva em userData (graus) e aplica em object.rotation (radianos).
+   * O eixo Three.js é extraído de "rx"→"x", "ry"→"y", "rz"→"z" via slice(1).
+   *
+   * @param {"rx"|"ry"|"rz"} axis - Eixo de rotação prefixado
+   * @param {string|number}  val  - Ângulo em graus
+   */
   const updateRot = useCallback((axis, val) => {
     const obj = selRef.current; if (!obj) return;
     let deg = parseFloat(val) || 0;
@@ -980,8 +1492,15 @@ export default function App() {
     setStatus(`🔄 ${axis.toUpperCase()}: ${Math.round(deg)}°`);
   }, []);
 
-  // ── UPDATE Y ──────────────────────────────────────────────────
-  // py = distância do chão até a BASE (borda inferior) da peça, em cm
+  /**
+   * Define a posição vertical (altura) da peça selecionada.
+   *
+   * `py` (positionY) representa a distância da BASE da peça até o chão (em cm).
+   * Como Three.js posiciona pelo centro: `position.y = base_cm/100 + h/2`
+   * Atualiza baseY no userData para que a animação de abertura use a posição correta.
+   *
+   * @param {string|number} valCm - Distância do chão em centímetros
+   */
   const updateY = useCallback((valCm) => {
     const obj = selRef.current; if (!obj) return;
     const baseCm = parseFloat(valCm) || 0;
@@ -996,7 +1515,15 @@ export default function App() {
     setSelData(d => ({...d, py: Math.round(baseCm)}));
   }, []);
 
-  // ── APPLY MATERIAL ────────────────────────────────────────────
+  /**
+   * Aplica um material ao corpo da peça selecionada.
+   *
+   * Descarta map (textura clonada) e material anterior antes de criar o novo —
+   * evitando memory leak na GPU. Para Groups, aplica apenas no filho isBody.
+   * Atualiza actMat (para novos adds) e selData.matId (para a UI).
+   *
+   * @param {string} mid - ID do material (catálogo ou vidro)
+   */
   const applyMat = useCallback((mid) => {
     setActMat(mid);
     const obj = selRef.current; if (!obj) return;
@@ -1020,7 +1547,13 @@ export default function App() {
     setStatus(`🎨 ${label}`);
   }, []);
 
-  // ── APPLY FRONT MATERIAL (gaveta) ────────────────────────────
+  /**
+   * Aplica um material exclusivamente ao painel frontal de uma gaveta.
+   * Só funciona para Groups (gaveta) com filho isFront.
+   * Salva em userData.frontMatId e atualiza selData.
+   *
+   * @param {string} mid - ID do material
+   */
   const applyFrontMat = useCallback((mid) => {
     const obj = selRef.current; if (!obj?.isGroup) return;
     obj.userData.frontMatId = mid;
@@ -1035,6 +1568,10 @@ export default function App() {
     const label = ALL_MAT_ITEMS.find(m=>m.id===mid)?.label || mid;
     setStatus(`🎨 Frente: ${label}`);
   }, []);
+  /**
+   * Alterna abertura/fechamento da peça selecionada (gaveta ou porta).
+   * Delega para toggleOpenClose() e sincroniza o estado React (selData.isOpen).
+   */
   const toggleOpen = useCallback(() => {
     const obj = selRef.current; if (!obj) return;
     toggleOpenClose(obj);
@@ -1042,7 +1579,10 @@ export default function App() {
     setStatus(obj.userData.isOpen ? `🔓 Abrindo ${obj.userData.label}...` : `🔒 Fechando ${obj.userData.label}...`);
   }, []);
 
-  // ── TOGGLE MAÇANETA ───────────────────────────────────────────
+  /**
+   * Mostra ou oculta o puxador da peça selecionada (porta ou gaveta).
+   * Alterna handle.visible e atualiza userData.hasHandle e selData.
+   */
   const toggleHandle = useCallback(() => {
     const obj = selRef.current; if (!obj?.isGroup) return;
     const handle = obj.children.find(c => c.userData.isHandle);
@@ -1054,7 +1594,15 @@ export default function App() {
     setStatus(!nowVisible ? `🔩 Maçaneta adicionada` : `🚫 Maçaneta removida`);
   }, []);
 
-  // ── TOGGLE LOCK (bloqueia movimentação) ───────────────────────
+  /**
+   * Bloqueia ou desbloqueia a movimentação da peça selecionada.
+   *
+   * Peças bloqueadas (userData.locked = true):
+   *   - Não podem ser arrastadas no viewport
+   *   - São obstáculos para colisão de outras peças
+   *   - Recebem outline laranja em vez de azul
+   *   - Exibem ícone 🔒 na lista da aba "Construir"
+   */
   const toggleLock = useCallback(() => {
     const obj = selRef.current; if (!obj?.userData) return;
     const nowLocked = !obj.userData.locked;
@@ -1091,7 +1639,14 @@ export default function App() {
     setStatus(`🚪 Dobradiça: ${newSide === "left" ? "Esquerda" : "Direita"}`);
   }, []);
 
-  // ── TOGGLE TIPO DA PORTA (abrir / correr) ────────────────────
+  /**
+   * Altera o tipo de abertura da porta selecionada entre "hinged" e "sliding".
+   *
+   * Fecha a porta antes de mudar (evita posição travada em estado intermediário).
+   * Controla a visibilidade das canaletas: visíveis apenas no modo "sliding".
+   *
+   * @param {"hinged"|"sliding"} newType - Novo tipo de abertura
+   */
   const toggleDoorType = useCallback((newType) => {
     const obj = selRef.current; if (!obj?.userData) return;
     if (obj.userData.typeId !== "porta") return;
@@ -1111,6 +1666,13 @@ export default function App() {
     setSelData(d => ({...d, doorType: newType, isOpen: false}));
     setStatus(newType === "sliding" ? `🛤 Porta de correr (canaleta)` : `🚪 Porta de abrir (dobradiça)`);
   }, []);
+  /**
+   * Define um ângulo de câmera predefinido.
+   * Suporta: "iso" | "top" | "front" | "back" | "left" | "right"
+   * Todos com raio fixo de 3.5m centrado em (0, 0.4, 0).
+   *
+   * @param {string} v - Nome da vista predefinida
+   */
   const setView = useCallback((v) => {
     const s = sph.current; s.cx=0; s.cy=0.4; s.cz=0;
     if (v==="iso")   { s.phi=0.65; s.theta=0.8;        s.radius=3.5; }
@@ -1122,19 +1684,37 @@ export default function App() {
     updateCam();
   }, [updateCam]);
 
-  // ── SELECT FROM LIST ──────────────────────────────────────────
+  /**
+   * Seleciona uma peça a partir do seu ID (usado pela lista da aba "Construir"
+   * e pela tabela do plano de corte).
+   *
+   * @param {number} id - userData.id da peça
+   */
   const selFromList = useCallback((id) => {
     const obj = piecesRef.current.find(p=>p.userData.id===id);
     if (obj) selectObj(obj);
   }, [selectObj]);
 
-  // ── RENAME ────────────────────────────────────────────────────
+  // ── RENOMEAR PEÇA ─────────────────────────────────────────────────────────
+  /**
+   * Ativa o modo de edição inline do nome de uma peça.
+   * Para a propagação do clique (evita selecionar a peça ao clicar no botão ✏).
+   * Foca o input após 30ms (aguarda o React renderizar o campo).
+   *
+   * @param {number} id    - userData.id da peça
+   * @param {string} label - Nome atual (pré-preenche o input)
+   * @param {Event}  e     - Evento de clique (para stopPropagation)
+   */
   const startRename = useCallback((id, label, e) => {
     e.stopPropagation();
     setEditingId(id); setEditingName(label);
     setTimeout(()=>renameRef.current?.focus(), 30);
   }, []);
 
+  /**
+   * Confirma a renomeação: atualiza userData.label, pieces state e selData.
+   * Cancela silenciosamente se o nome estiver vazio após trim().
+   */
   const confirmRename = useCallback(() => {
     const name = editingName.trim(); if (!name) { setEditingId(null); return; }
     const obj = piecesRef.current.find(p=>p.userData.id===editingId);
@@ -1145,10 +1725,14 @@ export default function App() {
     setStatus(`✏ Renomeado: ${name}`);
   }, [editingId, editingName]);
 
-  // ── HELPERS ───────────────────────────────────────────────────
+  // ── HELPERS DE FORMATAÇÃO ─────────────────────────────────────────────────
+  /** Converte metros para cm arredondado (ex: 0.36 → 36) */
   const cm  = v => v !== undefined ? Math.round(v * 100) : 0;
+  /** Arredonda para inteiro */
   const R   = v => Math.round(v);
+  /** Retorna o ícone do tipo de peça pelo typeId */
   const tIcon = id => PTYPES.find(t=>t.id===id)?.icon || "▭";
+  /** True se a peça selecionada tem animação (gaveta ou porta) */
   const isMovable = selData?.typeId==="gaveta" || selData?.typeId==="porta";
 
   // ══════════════════════════════════════════════════════════════
@@ -1692,6 +2276,16 @@ export default function App() {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPONENTES UI AUXILIARES
+// Componentes simples e sem estado usados para manter o JSX do App organizado.
+// Todos são definidos fora do App para evitar recriação a cada render.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * S — Section wrapper
+ * Container com padding e borda inferior para separar seções da sidebar.
+ */
 function S({children}) {
   return (
     <div style={{padding:"10px 12px",borderBottom:"1px solid #0e1828"}}>
@@ -1700,6 +2294,10 @@ function S({children}) {
   );
 }
 
+/**
+ * SL — Section Label
+ * Rótulo em uppercase com letter-spacing para títulos de seção.
+ */
 function SL({children}) {
   return (
     <div style={{fontSize:9,letterSpacing:1.5,color:"#3a5a7a",textTransform:"uppercase",
@@ -1707,6 +2305,15 @@ function SL({children}) {
   );
 }
 
+/**
+ * PBtn — Panel Button
+ * Botão de ação da sidebar com cor de fundo customizável e estado disabled.
+ *
+ * @param {React.ReactNode} children - Conteúdo do botão (texto + emoji)
+ * @param {Function}  onClick  - Callback de clique
+ * @param {string}    [c]      - Cor de fundo CSS (padrão: azul escuro)
+ * @param {boolean}   [disabled] - Quando true, desabilita clique e aplica opacidade
+ */
 function PBtn({children, onClick, c="#1e3a5a", disabled}) {
   return (
     <div onClick={disabled?null:onClick} style={{
@@ -1719,6 +2326,15 @@ function PBtn({children, onClick, c="#1e3a5a", disabled}) {
   );
 }
 
+/**
+ * DI — Dimension Input
+ * Campo numérico para editar dimensões (L, A, P) em centímetros.
+ * Exibe label à esquerda e sufixo "cm" à direita.
+ *
+ * @param {string}   label    - Texto descritivo da dimensão
+ * @param {number}   value    - Valor atual em cm
+ * @param {Function} onChange - Callback chamado com o novo valor (string)
+ */
 function DI({label, value, onChange}) {
   return (
     <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
@@ -1732,6 +2348,16 @@ function DI({label, value, onChange}) {
   );
 }
 
+/**
+ * MI — Material Item
+ * Card clicável do catálogo de materiais com swatch de cor e nome.
+ * Para vidros, exibe gradiente translúcido no swatch.
+ *
+ * @param {{id:string, label:string, color:string}} m - Dados do material
+ * @param {boolean}  active - Se este material está selecionado atualmente
+ * @param {Function} onSel  - Callback ao clicar
+ * @param {boolean}  [glass] - Se true, renderiza swatch especial de vidro
+ */
 function MI({m, active, onSel, glass}) {
   return (
     <div onClick={onSel} style={{
@@ -1751,6 +2377,10 @@ function MI({m, active, onSel, glass}) {
   );
 }
 
+/**
+ * QB — Quick Button
+ * Botão compacto para atalhos de rotação rápida (Flat, Pé, ⟳90°Y, etc.).
+ */
 function QB({children, onClick}) {
   return (
     <div onClick={onClick} style={{padding:"3px 7px",borderRadius:3,cursor:"pointer",
@@ -1760,6 +2390,12 @@ function QB({children, onClick}) {
   );
 }
 
+/**
+ * NoSel — No Selection placeholder
+ * Mensagem exibida nas abas "Editar" e "Material" quando nenhuma peça está selecionada.
+ *
+ * @param {string} [msg] - Mensagem customizada (padrão: instrução genérica)
+ */
 function NoSel({msg="Selecione uma peça na cena"}) {
   return (
     <div style={{margin:"12px",padding:"10px",background:"#0e1420",border:"1px solid #2a3a4a",
@@ -1767,10 +2403,29 @@ function NoSel({msg="Selecione uma peça na cena"}) {
   );
 }
 
-// ─────────────────────────────────────────────
-// PLANO DE CORTE — componente separado para evitar
-// criação de sub-componentes dentro do render principal
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ABA DE PLANO DE CORTE E ORÇAMENTO
+//
+// Separado em componente próprio para isolar o cálculo pesado do render
+// principal do App. Recebe `pieces` (state React) como prop para garantir
+// re-render sempre que peças são adicionadas, removidas ou renomeadas.
+//
+// Cálculos realizados:
+//   totalM2    → soma das áreas (L × A) de todas as peças em m²
+//   totalPerim → perímetro total de fita de borda (2×(L+A) + 4×esp por peça)
+//   chapas     → número de chapas necessárias (ceil(totalM2 / área_chapa))
+//   Custos:    material, fita, corte e mão de obra (opcional)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * PriceRow — linha de campo editável de preço no painel de configurações.
+ *
+ * @param {string}   label     - Descrição do campo
+ * @param {string}   field     - Chave em prices (ex: "priceM2")
+ * @param {string}   suffix    - Unidade exibida à direita (ex: "R$", "mm")
+ * @param {Object}   prices    - Objeto de preços atual
+ * @param {Function} setPrices - Setter do estado de preços
+ */
 function PriceRow({label, field, suffix, prices, setPrices}) {
   return (
     <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
@@ -1785,6 +2440,25 @@ function PriceRow({label, field, suffix, prices, setPrices}) {
   );
 }
 
+/**
+ * CutTab — Aba de Plano de Corte e Orçamento
+ *
+ * Lê piecesRef.current (dados 3D em tempo real) e calcula tudo localmente.
+ * O prop `pieces` (_piecesState) é usado apenas para acionar re-renders React
+ * quando a lista de peças muda — não é lido diretamente no cálculo.
+ *
+ * Filtra peças com dimensões > 10mm para excluir handles e tracks internos.
+ * Dimensões exibidas em mm (inteiros) para praticidade de marcenaria.
+ *
+ * Exporta relatório em .txt via Blob URL — sem dependências externas.
+ *
+ * @param {Array}    pieces      - Estado React de peças (só para trigger de re-render)
+ * @param {Object}   prices      - Configurações de preço atuais
+ * @param {Function} setPrices   - Setter de preços
+ * @param {Object}   piecesRef   - Ref com array de objetos 3D da cena
+ * @param {Function} selFromList - Callback para selecionar peça por ID
+ * @param {Function} toggleLock  - Callback para bloquear/desbloquear peça
+ */
 // BUG 2 FIX: pieces (state) recebido como prop — garante re-render ao adicionar/remover peças
 function CutTab({pieces: _piecesState, prices, setPrices, piecesRef, selFromList, toggleLock}) {
   const CW = prices.chapaW, CH = prices.chapaH;
