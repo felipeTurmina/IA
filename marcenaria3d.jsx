@@ -499,44 +499,57 @@ function fastBox(obj) {
   );
 }
 
-// Snap magnético entre bordas de peças — estilo SketchUp
-const SNAP_MAG = 0.04; // 4cm de alcance magnético
+// Snap magnético entre bordas de peças em X, Y e Z — estilo SketchUp
+// Detecta: borda-a-borda (encaixe), centro-a-centro (alinhamento)
+const SNAP_MAG = 0.06; // 6cm de alcance magnético
+
 function edgeSnap(moving, others) {
-  const mw = moving.userData.w || 0.1;
-  const md = moving.userData.d || 0.1;
+  const {w:mw=0.1, h:mh=0.1, d:md=0.1} = moving.userData;
   const px = moving.position.x;
+  const py = moving.position.y;
   const pz = moving.position.z;
-  let bestX = null, bestZ = null, bdX = SNAP_MAG, bdZ = SNAP_MAG;
+
+  let bestX = null, bestY = null, bestZ = null;
+  let bdX = SNAP_MAG, bdY = SNAP_MAG, bdZ = SNAP_MAG;
 
   for (const o of others) {
     if (o === moving) continue;
-    const ow = o.userData.w || 0.1;
-    const od = o.userData.d || 0.1;
+    const {w:ow=0.1, h:oh=0.1, d:od=0.1} = o.userData;
     const ox = o.position.x;
+    const oy = o.position.y;
     const oz = o.position.z;
 
-    // Bordas em X: direita-esquerda e esquerda-direita
-    const checksX = [
-      (px + mw/2) - (ox - ow/2),  // borda dir moving → borda esq other
-      (px - mw/2) - (ox + ow/2),  // borda esq moving → borda dir other
-      px - ox,                     // centros alinhados em X
-    ];
-    for (const delta of checksX) {
+    // ── X: borda direita-esquerda, esquerda-direita, centros ──
+    for (const delta of [
+      (px + mw/2) - (ox - ow/2),   // dir → esq
+      (px - mw/2) - (ox + ow/2),   // esq → dir
+      px - ox,                       // centros
+    ]) {
       if (Math.abs(delta) < bdX) { bdX = Math.abs(delta); bestX = delta; }
     }
 
-    // Bordas em Z
-    const checksZ = [
+    // ── Y: topo-base, base-topo, centros ──
+    // "topo de moving encosta na base de other" e vice-versa
+    for (const delta of [
+      (py + mh/2) - (oy - oh/2),   // topo moving → base other
+      (py - mh/2) - (oy + oh/2),   // base moving → topo other
+      py - oy,                       // centros Y
+    ]) {
+      if (Math.abs(delta) < bdY) { bdY = Math.abs(delta); bestY = delta; }
+    }
+
+    // ── Z: frente-trás, trás-frente, centros ──
+    for (const delta of [
       (pz + md/2) - (oz - od/2),
       (pz - md/2) - (oz + od/2),
       pz - oz,
-    ];
-    for (const delta of checksZ) {
+    ]) {
       if (Math.abs(delta) < bdZ) { bdZ = Math.abs(delta); bestZ = delta; }
     }
   }
 
   if (bestX !== null) moving.position.x = snapGrid(moving.position.x - bestX);
+  if (bestY !== null) moving.position.y = Math.round((moving.position.y - bestY) * 1000) / 1000; // Y: precisão 1mm
   if (bestZ !== null) moving.position.z = snapGrid(moving.position.z - bestZ);
 }
 
@@ -586,13 +599,10 @@ export default function App() {
 
   // Preços editáveis globalmente
   const [prices, setPrices] = useState({
-    chapaW: 2750,   // largura chapa mm
-    chapaH: 1850,   // altura chapa mm
-    priceM2: 145,   // R$/m² material
-    fitaM: 0.85,    // R$/m fita de borda
-    corteChapa: 18, // R$ por chapa (custo de corte/serra)
-    moObraM2: 0,    // R$/m² mão de obra (opcional)
+    chapaW: 2750, chapaH: 1850,
+    priceM2: 145, fitaM: 0.85, corteChapa: 18, moObraM2: 0,
   });
+  const [colisionOn, setColisionOn] = useState(false); // colisão entre peças
 
   // ── INIT THREE.JS ──────────────────────────────────────────────
   useEffect(() => {
@@ -701,7 +711,7 @@ export default function App() {
     setSelId(ud.id);
     setSelData({
       ...ud,
-      py: Math.round(obj.position.y * 100),
+      py: Math.round((obj.position.y - (ud.h||0)/2) * 100), // base do chão em cm
       hasHandle: ud.hasHandle !== false,
       frontMatId: ud.frontMatId || ud.matId,
       doorSide: ud.doorSide || "left",
@@ -779,11 +789,30 @@ export default function App() {
       rc.current.setFromCamera(getNDC(e), cameraRef.current);
       const pt = new THREE.Vector3();
       if (rc.current.ray.intersectPlane(dplane.current, pt)) {
-        selRef.current.position.x = snapGrid(pt.x + (dragS.current.ox || 0));
-        selRef.current.position.z = snapGrid(pt.z + (dragS.current.oz || 0));
+        const obj = selRef.current;
+        const prevX = obj.position.x;
+        const prevZ = obj.position.z;
+
+        obj.position.x = snapGrid(pt.x + (dragS.current.ox || 0));
+        obj.position.z = snapGrid(pt.z + (dragS.current.oz || 0));
+
         // Snap magnético entre bordas de peças (leve — usa userData, não Box3)
-        edgeSnap(selRef.current, piecesRef.current);
-        syncOutline(selRef.current, sceneRef.current);
+        edgeSnap(obj, piecesRef.current);
+
+        // Colisão: se colidir com outra peça, reverte posição
+        if (colisionOn) {
+          const box = fastBox(obj);
+          const collides = piecesRef.current.some(o => {
+            if (o === obj || o.userData.locked) return false;
+            return box.intersectsBox(fastBox(o));
+          });
+          if (collides) {
+            obj.position.x = prevX;
+            obj.position.z = prevZ;
+          }
+        }
+
+        syncOutline(obj, sceneRef.current);
       }
     }
   }, [getNDC, updateCam]);
@@ -811,6 +840,12 @@ export default function App() {
     dragS.current = {on:false, ox:0, oz:0};
     orbit.current = {on:false};
     panS.current  = {on:false};
+    // Atualiza py no selData caso snap vertical tenha mudado Y
+    if (selRef.current) {
+      const obj = selRef.current;
+      const baseCm = Math.round((obj.position.y - (obj.userData.h||0)/2) * 100);
+      setSelData(d => d ? {...d, py: baseCm} : d);
+    }
   }, []);
 
   const onWheel = useCallback((e) => {
@@ -932,12 +967,19 @@ export default function App() {
   }, []);
 
   // ── UPDATE Y ──────────────────────────────────────────────────
+  // py = distância do chão até a BASE (borda inferior) da peça, em cm
   const updateY = useCallback((valCm) => {
     const obj = selRef.current; if (!obj) return;
-    const y = (parseFloat(valCm) || 0) / 100;
-    obj.position.y = y;
+    const baseCm = parseFloat(valCm) || 0;
+    const h = obj.userData.h || 0.1;
+    // position.y é o CENTRO — base = position.y - h/2
+    // logo: position.y = base + h/2
+    obj.position.y = baseCm / 100 + h / 2;
+    if (obj.userData) {
+      obj.userData.baseY = obj.position.y;
+    }
     syncOutline(obj, sceneRef.current);
-    setSelData(d => ({...d, py: Math.round(y*100)}));
+    setSelData(d => ({...d, py: Math.round(baseCm)}));
   }, []);
 
   // ── APPLY MATERIAL ────────────────────────────────────────────
@@ -1366,10 +1408,79 @@ export default function App() {
               </div>
             </S>
 
-            {/* Posição Y */}
+            {/* Posição Y — altura com encaixe automático */}
             <S>
-              <SL>Altura do Chão (cm)</SL>
-              <DI label="↑ Distância do chão" value={selData.py??0} onChange={updateY}/>
+              <SL>Posição Vertical (altura)</SL>
+
+              {/* Campo de altura com botões ±1cm */}
+              <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:6}}>
+                <div style={{fontSize:9,color:"#4a6a7a",width:90,flexShrink:0}}>↑ Do chão (cm)</div>
+                <div onClick={()=>updateY((selData.py??0)-1)}
+                  style={{width:24,height:28,background:"#0a1020",border:"1px solid #1a3a5a",
+                    borderRadius:"4px 0 0 4px",cursor:"pointer",display:"flex",
+                    alignItems:"center",justifyContent:"center",fontSize:14,color:"#4a7aaa",
+                    flexShrink:0,userSelect:"none"}}>−</div>
+                <input type="number" step={1} value={selData.py??0}
+                  onChange={e=>updateY(e.target.value)}
+                  style={{flex:1,padding:"4px 5px",background:"#080c18",border:"1px solid #2a3a5a",
+                    borderTop:"1px solid #2a3a5a",borderBottom:"1px solid #2a3a5a",
+                    borderLeft:"none",borderRight:"none",
+                    color:"#80c0e0",fontSize:11,outline:"none",textAlign:"center",minWidth:0}}/>
+                <div onClick={()=>updateY((selData.py??0)+1)}
+                  style={{width:24,height:28,background:"#0a1020",border:"1px solid #1a3a5a",
+                    borderRadius:"0 4px 4px 0",cursor:"pointer",display:"flex",
+                    alignItems:"center",justifyContent:"center",fontSize:14,color:"#4a7aaa",
+                    flexShrink:0,userSelect:"none"}}>+</div>
+                <div style={{fontSize:9,color:"#3a5a7a",flexShrink:0}}>cm</div>
+              </div>
+
+              {/* Botão: Pousar no chão */}
+              <div onClick={()=>updateY(0)} style={{
+                display:"flex",alignItems:"center",gap:8,padding:"7px 10px",
+                borderRadius:5,cursor:"pointer",marginBottom:4,
+                background:"#080e18",border:"1px solid #1a3a5a",transition:"all 0.12s"}}>
+                <span style={{fontSize:14}}>⬇</span>
+                <div>
+                  <div style={{fontSize:10,fontWeight:600,color:"#4a8aaa"}}>Pousar no chão</div>
+                  <div style={{fontSize:8,color:"#3a5060"}}>define altura = 0</div>
+                </div>
+              </div>
+
+              {/* Botão: Encaixar no topo de outra peça */}
+              <div onClick={()=>{
+                const obj = selRef.current; if (!obj) return;
+                const {w:mw=0.1, h:mh=0.1, d:md=0.1} = obj.userData;
+                // Encontra a peça mais próxima em X/Z cujo topo encaixa a base do moving
+                let bestTopY = null, bestDist = Infinity;
+                for (const o of piecesRef.current) {
+                  if (o === obj) continue;
+                  const {w:ow=0.1, h:oh=0.1, d:od=0.1} = o.userData;
+                  // Verifica sobreposição em X e Z
+                  const dx = Math.abs(obj.position.x - o.position.x) - (mw/2 + ow/2);
+                  const dz = Math.abs(obj.position.z - o.position.z) - (md/2 + od/2);
+                  if (dx < 0.08 && dz < 0.08) { // há sobreposição ou proximidade horizontal
+                    const topY = o.position.y + oh/2; // topo da peça abaixo em metros
+                    const dist = Math.abs((obj.position.y - mh/2) - topY);
+                    if (dist < bestDist) { bestDist = dist; bestTopY = topY; }
+                  }
+                }
+                if (bestTopY !== null) {
+                  // base do moving = topY → posição em cm para updateY
+                  updateY(Math.round(bestTopY * 100));
+                  setStatus("🔝 Encaixado no topo da peça abaixo");
+                } else {
+                  setStatus("⚠ Nenhuma peça abaixo — alinhe em X/Z primeiro");
+                }
+              }} style={{
+                display:"flex",alignItems:"center",gap:8,padding:"7px 10px",
+                borderRadius:5,cursor:"pointer",
+                background:"#0a1420",border:"1px solid #2a4a6a",transition:"all 0.12s"}}>
+                <span style={{fontSize:14}}>🔝</span>
+                <div>
+                  <div style={{fontSize:10,fontWeight:600,color:"#5a9aaa"}}>Encaixar no topo</div>
+                  <div style={{fontSize:8,color:"#3a5060"}}>sobe até encostar na peça abaixo</div>
+                </div>
+              </div>
             </S>
           </>}
         </>}
@@ -1457,6 +1568,24 @@ export default function App() {
               <PBtn onClick={()=>{sph.current.radius=Math.max(0.5,sph.current.radius-0.5);updateCam();}} c="#1a2a2a">🔍 +</PBtn>
               <PBtn onClick={()=>{sph.current.radius=Math.min(14,sph.current.radius+0.5);updateCam();}} c="#1a2a2a">🔍 −</PBtn>
             </div>
+            <SL style={{marginTop:8}}>Ferramentas</SL>
+            {/* Colisão toggle */}
+            <div onClick={()=>setColisionOn(v=>!v)} style={{
+              display:"flex",alignItems:"center",gap:8,padding:"8px 10px",
+              borderRadius:6,cursor:"pointer",marginBottom:4,
+              background:colisionOn?"#0e1e10":"#0e0e18",
+              border:`2px solid ${colisionOn?"#2a8a3a":"#2a2a3a"}`,
+              transition:"all 0.15s"}}>
+              <span style={{fontSize:16}}>{colisionOn?"🧱":"🫥"}</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:11,fontWeight:600,color:colisionOn?"#70c080":"#4a6a7a"}}>
+                  {colisionOn?"Colisão Ativa":"Colisão Desativada"}
+                </div>
+                <div style={{fontSize:9,color:"#3a5a4a"}}>
+                  {colisionOn?"peças não se atravessam":"livre atravessar"}
+                </div>
+              </div>
+            </div>
           </S>
         )}
 
@@ -1472,10 +1601,13 @@ export default function App() {
 
         {/* Status bar */}
         <div style={{height:22,background:"#080810",borderTop:"1px solid #121222",flexShrink:0,
-          display:"flex",alignItems:"center",padding:"0 14px",fontSize:10}}>
-          <span style={{color:"#3a6a40",marginRight:8}}>●</span>
-          <span style={{color:"#4a6a50"}}>{status}</span>
-          <span style={{marginLeft:"auto",color:"#2a3a3a"}}>Peças: {pieces.length}</span>
+          display:"flex",alignItems:"center",padding:"0 14px",fontSize:10,gap:8}}>
+          <span style={{color:"#3a6a40"}}>●</span>
+          <span style={{color:"#4a6a50",flex:1}}>{status}</span>
+          <span style={{color:colisionOn?"#3a7a3a":"#2a3a4a",fontSize:9}} title="Colisão">
+            {colisionOn?"🧱":"🫥"}
+          </span>
+          <span style={{color:"#2a3a3a",fontSize:9}}>Peças: {pieces.length}</span>
         </div>
 
         {/* HUD rotação */}
