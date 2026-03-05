@@ -119,7 +119,7 @@ function makeTex(key, w, h) {
   const t = _texCache[key].clone(); // clone leve: compartilha GPU buffer, repeat independente
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   t.repeat.set(w/0.5, h/0.5);
-  t.needsUpdate = false;
+  t.needsUpdate = true; // FIX #3: clone precisa de needsUpdate=true para upload na GPU
   return t;
 }
 
@@ -293,7 +293,7 @@ const PTYPES = [
  * @param {number} pD - Profundidade da peça-pai em metros
  * @returns {THREE.Group} Grupo com todos os meshes do puxador
  */
-function makeHandle(pW, pH, pD) {
+function makeHandle(pW, pH, pD, handleY) {
   const g = new THREE.Group();
   g.userData.isHandle = true;
   const barW = Math.min(pW * 0.55, 0.18);
@@ -315,7 +315,10 @@ function makeHandle(pW, pH, pD) {
   rosL.position.set(-barW/2, 0, -(legH+0.001));
   rosR.position.set( barW/2, 0, -(legH+0.001));
   [bar,legL,legR,rosL,rosR].forEach(m=>{ m.castShadow=true; g.add(m); });
-  g.position.set(0, 0, pD/2 + legH + 0.004);
+  // handleY = deslocamento vertical em metros a partir do centro da peca
+  // Se nao fornecido: padrao = 0 (centro). Para porta: ~30% da altura acima do centro.
+  const offsetY = (handleY !== undefined && handleY !== null) ? handleY : 0;
+  g.position.set(0, offsetY, pD/2 + legH + 0.004);
   return g;
 }
 
@@ -424,7 +427,6 @@ function makePiece(typeId, matId, x=0, y=0, z=0) {
   // --- PEÇAS COM PUXADOR: usa Group ---
   if (needsHandle) {
     const grp = new THREE.Group();
-    grp.position.set(x, y+h/2, z);
 
     if (typeId === "gaveta") {
       // Corpo da gaveta (sem a face frontal)
@@ -449,19 +451,29 @@ function makePiece(typeId, matId, x=0, y=0, z=0) {
       front.userData.isFront = true;
       grp.add(front);
     } else {
-      // Porta: body simples
+      // PORTA — origin do Group na borda da dobradica para rotacao correta
+      // doorSide "left" (puxador esq) -> dobradica direita -> body offset X = -w/2
       const body = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), buildMat(mid,w,h));
+      body.position.set(-w/2, 0, 0); // borda direita do body fica em X=0 (a dobradica)
       body.castShadow = true; body.receiveShadow = true;
       body.userData.isBody = true;
       grp.add(body);
-      // Canaletas — adicionadas sempre, visibilidade controlada por doorType
       const track = makeTrack(w, h, d);
-      track.visible = false; // default: porta de abrir, sem trilho
+      track.position.set(-w/2, 0, 0);
+      track.visible = false;
       grp.add(track);
     }
 
-    grp.add(makeHandle(w, h, d));
+    // handleY default: para porta = 30% da altura acima do centro; gaveta = 0 (centro)
+    const defaultHandleY = typeId === "porta" ? h * 0.30 : 0;
+    const handle = makeHandle(w, h, d, defaultHandleY);
+    handle.position.x = -w/2; // puxador acompanha o body
+    grp.add(handle);
 
+    // Grupo posicionado na borda direita da porta (dobradica padrao "left")
+    grp.position.set(x + w/2, y+h/2, z);
+
+    const _defHandleY = typeId === "porta" ? h * 0.30 : 0;
     grp.userData = {
       id, typeId, matId:mid,
       frontMatId: mid,
@@ -469,10 +481,11 @@ function makePiece(typeId, matId, x=0, y=0, z=0) {
       rx:0, ry:0, rz:0,
       label:`${tp.label} ${id}`,
       isOpen:false, openProgress:0,
-      baseX:x, baseZ:z, baseRY:0,
+      baseX:x + (typeId==="porta" ? w/2 : 0), baseZ:z, baseRY:0,
       hasHandle: true,
-      doorSide: "left",   // "left" | "right" — para porta de abrir
-      doorType: "hinged", // "hinged" | "sliding"
+      handleY: _defHandleY,
+      doorSide: "left",
+      doorType: "hinged",
     };
     return grp;
   }
@@ -533,10 +546,13 @@ function rebuildPiece(obj) {
       oldH.traverse(c=>{ if(c.isMesh){c.geometry.dispose(); c.material.dispose();} });
       obj.remove(oldH);
     }
-    const newH = makeHandle(w, h, d);
+    const newH = makeHandle(w, h, d, obj.userData.handleY !== undefined ? obj.userData.handleY : (obj.userData.typeId==="porta" ? h*0.30 : 0));
     newH.visible = obj.userData.hasHandle !== false;
+    // Reposicionar X do handle conforme doorSide
+    if (obj.userData.typeId === "porta") {
+      newH.position.x = obj.userData.doorSide === "right" ? w/2 : -w/2;
+    }
     obj.add(newH);
-    // rebuild track (porta de correr)
     if (typeId === "porta") {
       const oldT = obj.children.find(c=>c.userData.isTrack);
       if (oldT) {
@@ -546,6 +562,11 @@ function rebuildPiece(obj) {
       const newT = makeTrack(w, h, d);
       newT.visible = obj.userData.doorType === "sliding";
       obj.add(newT);
+      // Reposicionar filhos com offset correto para o doorSide atual
+      const _cX = obj.userData.doorSide === "right" ? w/2 : -w/2;
+      obj.children.forEach(c => {
+        if (c.userData.isBody || c.userData.isTrack || c.userData.isHandle) c.position.x = _cX;
+      });
     }
   } else {
     obj.geometry.dispose();
@@ -579,22 +600,29 @@ function rebuildPiece(obj) {
 /**
  * Alterna o estado aberto/fechado de uma gaveta ou porta.
  *
- * Salva a posição base (baseX, baseZ, baseRY) apenas quando a peça está
- * fechada — preserva a referência correta para a animação de retorno.
+ * Grava baseX/baseZ/baseRY SOMENTE quando a peça está totalmente fechada
+ * (openProgress == 0) — esse é o único momento em que a posição é confiável.
+ * Nas demais situações (meio da animação ou já aberta), a base gravada
+ * anteriormente é preservada para garantir o retorno correto.
  *
  * @param {THREE.Group} obj - A peça (deve ser gaveta ou porta)
  */
 function toggleOpenClose(obj) {
   if (!obj?.userData) return;
   const {typeId} = obj.userData;
-  if (typeId!=="gaveta" && typeId!=="porta") return;
-  // Salva posição base somente quando está fechada
-  if (!obj.userData.isOpen) {
-    obj.userData.baseX  = obj.position.x;
-    obj.userData.baseZ  = obj.position.z;
-    obj.userData.baseRY = obj.rotation.y;
+  if (typeId !== "gaveta" && typeId !== "porta") return;
+
+  const ud = obj.userData;
+
+  // Grava a base apenas quando a peça está completamente fechada e parada.
+  // Isso garante que baseX/baseZ/baseRY sempre reflitam a posição real de repouso.
+  if (ud.openProgress === 0 && !ud.isOpen) {
+    ud.baseX  = obj.position.x;
+    ud.baseZ  = obj.position.z;
+    ud.baseRY = obj.rotation.y;
   }
-  obj.userData.isOpen = !obj.userData.isOpen;
+
+  ud.isOpen = !ud.isOpen;
   animSet.add(obj);
 }
 
@@ -602,10 +630,10 @@ function toggleOpenClose(obj) {
  * Aplica a transformação de posição e rotação de uma porta de dobradiça
  * para um dado progresso de abertura.
  *
- * A porta gira 105° em torno da sua borda (pivô).
- * O pivô é calculado com base em doorSide:
- *   "right" → pivô em baseX + w/2 (borda direita)
- *   "left"  → pivô em baseX - w/2 (borda esquerda)
+ * A porta gira 95° em torno da sua borda (pivô).
+ * O pivô é calculado com base em doorSide (lado do PUXADOR):
+ *   "left"  puxador → dobradiça na borda DIREITA  → pivô em baseX + w/2
+ *   "right" puxador → dobradiça na borda ESQUERDA → pivô em baseX - w/2
  *
  * Translação X e Z são recalculadas a cada frame para manter o pivô fixo
  * durante a rotação (evita o efeito de "escorregar").
@@ -615,28 +643,19 @@ function toggleOpenClose(obj) {
  */
 function applyDoorTransform(obj, progress) {
   const ud = obj.userData;
-  const hw = ud.w / 2;
-  // side: esquerda = dobradiça no X negativo, direita = X positivo
-  const isRight = ud.doorSide === "right";
-  // Porta abre 105° — sinal positivo gira anti-horário (esquerda), negativo horário (direita)
-  const sign = isRight ? -1 : 1;
-  const angle = progress * THREE.MathUtils.degToRad(105) * sign;
-
+  // Origin do Group = borda da dobradica (pivot correto).
+  // Porta abre PARA FRENTE (Z positivo = em direcao ao usuario).
+  // "left"  puxador esq -> dobradica na borda DIREITA do body
+  //   body esta em X = -w/2 do pivot -> girar anti-horario em Y (angulo positivo)
+  //   pois o corpo vai para Z+ ao girar positivo em Y quando esta a esquerda do pivot
+  // "right" puxador dir -> dobradica na borda ESQUERDA do body
+  //   body esta em X = +w/2 do pivot -> girar horario em Y (angulo negativo)
+  const sign = ud.doorSide === "left" ? 1 : -1;
+  const angle = sign * progress * THREE.MathUtils.degToRad(95);
   obj.rotation.y = ud.baseRY + angle;
-
-  if (isRight) {
-    // Pivô na borda direita: baseX + hw
-    const px = ud.baseX + hw;
-    obj.position.x = px - Math.cos(angle) * hw;
-    obj.position.z = ud.baseZ + Math.sin(angle) * hw;
-  } else {
-    // Pivô na borda esquerda: baseX - hw
-    const px = ud.baseX - hw;
-    obj.position.x = px + Math.cos(angle) * hw;
-    obj.position.z = ud.baseZ - Math.sin(angle) * hw;
-  }
+  obj.position.x = ud.baseX;
+  obj.position.z = ud.baseZ;
 }
-
 /**
  * Avança todas as animações ativas em um frame.
  * Deve ser chamado dentro do loop de renderização com o delta de tempo real.
@@ -713,15 +732,28 @@ const OUTLINE_TAG = "__outline__";
  * @returns {{size: THREE.Vector3, center: THREE.Vector3}}
  */
 function getOutlineBox(obj) {
-  // Para grupos (porta/gaveta) usa dimensões do userData — tamanho fixo, sem flicker
   if (obj.isGroup && obj.userData.w) {
     const {w, h, d} = obj.userData;
-    return { size: new THREE.Vector3(w + 0.008, h + 0.008, d + 0.008), center: obj.position.clone() };
+    if (obj.userData.typeId === "porta") {
+      // Porta: o body fica em posicao local X = -w/2 (ou +w/2 para doorSide right).
+      // Precisamos do centro WORLD do body, ignorando puxador (que projeta em Z extra).
+      // Usar getWorldPosition no body filho e o tamanho real w x h x d.
+      const body = obj.children.find(c => c.userData.isBody);
+      if (body) {
+        const worldCenter = new THREE.Vector3();
+        body.getWorldPosition(worldCenter);
+        const size = new THREE.Vector3(w + 0.008, h + 0.008, d + 0.008);
+        return { size, center: worldCenter };
+      }
+    }
+    // Gaveta e outros grupos: dimensoes do userData, centro = posicao do grupo
+    const size = new THREE.Vector3(w + 0.008, h + 0.008, d + 0.008);
+    const center = obj.position.clone();
+    return { size, center };
   }
-  // Para meshes simples usa bounding box
+  // Meshes simples: bounding box real
   const box = new THREE.Box3().setFromObject(obj);
-  const size = new THREE.Vector3(); box.getSize(size);
-  size.addScalar(0.008);
+  const size = new THREE.Vector3(); box.getSize(size); size.addScalar(0.008);
   const center = new THREE.Vector3(); box.getCenter(center);
   return { size, center };
 }
@@ -741,6 +773,12 @@ function addOutline(obj, scene) {
   geo.dispose();
   const ol = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({color:0x44aaff, depthTest:false}));
   ol.position.copy(center);
+  // Para porta: o outline deve rotacionar junto com a porta (em torno do proprio centro)
+  if (obj.userData && obj.userData.typeId === "porta") {
+    ol.rotation.copy(obj.rotation);
+  } else {
+    ol.rotation.set(0,0,0);
+  }
   ol.userData[OUTLINE_TAG] = true;
   ol.renderOrder = 999;
   scene.add(ol);
@@ -766,13 +804,10 @@ function clearOutline(scene) {
 function syncOutline(obj, scene) {
   const ol = scene.children.find(c=>c.userData[OUTLINE_TAG]);
   if (!ol) return;
+  // Sempre usar getOutlineBox para calcular center correto
+  // (porta: origin e dobradica, nao centro visual)
   const { center } = getOutlineBox(obj);
-  // Para grupos: segue a posição do objeto diretamente
-  if (obj.isGroup) {
-    ol.position.copy(obj.position);
-  } else {
-    ol.position.copy(center);
-  }
+  ol.position.copy(center);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -848,6 +883,7 @@ function edgeSnap(moving, others) {
 
   for (const o of others) {
     if (o === moving) continue;
+    if (o.userData.isFloor || !o.userData.id) continue; // ignora piso e objetos internos
     const {w:ow=0.1, h:oh=0.1, d:od=0.1} = o.userData;
     const ox = o.position.x;
     const oy = o.position.y;
@@ -883,7 +919,7 @@ function edgeSnap(moving, others) {
   }
 
   if (bestX !== null) moving.position.x = snapGrid(moving.position.x - bestX);
-  if (bestY !== null) moving.position.y = Math.round((moving.position.y - bestY) * 1000) / 1000; // Y: precisão 1mm
+  // FIX #7: snap Y removido do drag — causa oscilacao com o plano horizontal fixo
   if (bestZ !== null) moving.position.z = snapGrid(moving.position.z - bestZ);
 }
 
@@ -1075,7 +1111,7 @@ export default function App() {
     floor.userData.isFloor = true;
     scene.add(floor);
     // Grade: 8m / 8000 divisões = 1mm por quadrado
-    scene.add(new THREE.GridHelper(8, 8000, 0x2a2a50, 0x1a1a38));
+    scene.add(new THREE.GridHelper(8, 400, 0x2a2a50, 0x1a1a38)); // FIX #4: era 8000, travava
 
     // Animate loop
     let fid, last = performance.now();
@@ -1085,16 +1121,34 @@ export default function App() {
       const dt = Math.min((now - last) / 1000, 0.05);
       last = now;
       tickAnimations(dt);
-      // Outline acompanha o objeto selecionado em tempo real (sem flicker)
-      const sel = selRef.current;
-      if (sel) {
+      // Sincronizar outline com a peca selecionada a cada frame
+      const selNow = selRef.current;
+      if (selNow) {
         const ol = scene.children.find(c=>c.userData[OUTLINE_TAG]);
-        if (ol) ol.position.copy(sel.position);
+        if (ol) {
+          const {center} = getOutlineBox(selNow);
+          ol.position.copy(center);
+          // Porta: outline rotaciona junto com a porta
+          if (selNow.userData && selNow.userData.typeId === "porta") {
+            ol.rotation.copy(selNow.rotation);
+          } else {
+            ol.rotation.set(0,0,0);
+          }
+        }
       }
       renderer.render(scene, camera);
     };
     loop();
 
+    // FIX #2: listener nativo com passive:false para permitir preventDefault no zoom
+    const _wh = (e) => {
+      e.preventDefault();
+      sph.current.radius = Math.max(0.5, Math.min(14, sph.current.radius + e.deltaY * 0.004));
+      const {theta,phi,radius,cx,cy,cz} = sph.current;
+      camera.position.set(cx+radius*Math.sin(phi)*Math.sin(theta), cy+radius*Math.cos(phi), cz+radius*Math.sin(phi)*Math.cos(theta));
+      camera.lookAt(cx,cy,cz);
+    };
+    renderer.domElement.addEventListener("wheel", _wh, {passive:false});
     const onResize = () => {
       const w = mount.clientWidth, h = mount.clientHeight;
       camera.aspect = w/h; camera.updateProjectionMatrix();
@@ -1103,7 +1157,9 @@ export default function App() {
     window.addEventListener("resize", onResize);
     return () => {
       cancelAnimationFrame(fid);
+      renderer.domElement.removeEventListener("wheel", _wh);
       window.removeEventListener("resize", onResize);
+      animSet.clear(); // FIX #1: evita refs stale apos hot-reload
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       renderer.dispose();
     };
@@ -1154,6 +1210,7 @@ export default function App() {
       ...ud,
       py: Math.round((obj.position.y - (ud.h||0)/2) * 100), // base do chão em cm
       hasHandle: ud.hasHandle !== false,
+      handleY: ud.handleY !== undefined ? ud.handleY : (ud.typeId === "porta" ? (ud.h||0.7)*0.30 : 0),
       frontMatId: ud.frontMatId || ud.matId,
       doorSide: ud.doorSide || "left",
       doorType: ud.doorType || "hinged",
@@ -1161,6 +1218,7 @@ export default function App() {
     });
     setActMat(ud.matId);
     if (ud.typeId !== "gaveta") setMatTarget("corpo");
+    setTab(t => (t==="add"||t==="edit"||t==="mat") ? "edit" : t); // FIX #9: auto-tab
     setStatus(ud.locked ? `🔒 ${ud.label} (bloqueada)` : `✓ ${ud.label}`);
   }, []);
 
@@ -1283,15 +1341,16 @@ export default function App() {
         syncOutline(obj, sceneRef.current);
       }
     }
-  }, [getNDC, updateCam]);
+  }, [getNDC, updateCam, colisionOn]);
 
   /**
    * mouseup / mouseleave: finaliza qualquer arrasto ativo.
    *
    * Ao soltar uma peça:
    *   - Aplica snapGrid(1mm) na posição final (X e Z)
-   *   - Atualiza baseX/baseZ/baseRY para a animação de abrir/fechar
-   *   - Se a peça estava aberta, força fechamento imediato
+   *   - Atualiza baseX/baseZ/baseRY SOMENTE se a peça estiver fechada e parada
+   *     (isOpen=false e openProgress=0) — preserva a posição de retorno de
+   *     portas/gavetas que estejam abertas ou animando no momento do soltar
    *   - Atualiza py no selData (pode ter mudado via snap vertical)
    */
   const onMU = useCallback(() => {
@@ -1300,16 +1359,14 @@ export default function App() {
       // Snap final garante alinhamento exato com a grade
       obj.position.x = snapGrid(obj.position.x);
       obj.position.z = snapGrid(obj.position.z);
-      // CRÍTICO: atualiza base para animação de abrir/fechar usar posição correta
       if (obj.userData) {
-        obj.userData.baseX = obj.position.x;
-        obj.userData.baseZ = obj.position.z;
-        obj.userData.baseRY = obj.rotation.y;
-        // Se estava aberta, força fechamento e reseta progresso
-        if (obj.userData.isOpen) {
-          obj.userData.isOpen = false;
-          obj.userData.openProgress = 0;
-          animSet.delete(obj);
+        const isAnimating = obj.userData.isOpen || (obj.userData.openProgress > 0);
+        // Só atualiza a base se a peça estiver totalmente fechada e parada.
+        // Se estiver aberta/animando, a base já foi gravada ao abrir — não sobrescrever.
+        if (!isAnimating) {
+          obj.userData.baseX  = obj.position.x;
+          obj.userData.baseZ  = obj.position.z;
+          obj.userData.baseRY = obj.rotation.y;
         }
       }
       syncOutline(obj, sceneRef.current);
@@ -1329,11 +1386,8 @@ export default function App() {
    * wheel: controla o zoom ajustando o raio da câmera esférica.
    * Raio limitado entre 0.5m (muito perto) e 14m (visão geral).
    */
-  const onWheel = useCallback((e) => {
-    e.preventDefault();
-    sph.current.radius = Math.max(0.5, Math.min(14, sph.current.radius + e.deltaY * 0.004));
-    updateCam();
-  }, [updateCam]);
+  // FIX #2: zoom tratado via listener nativo (passive:false) adicionado no useEffect
+  const onWheel = useCallback(() => {}, []);
 
   // ── AÇÕES DE PEÇA ─────────────────────────────────────────────────────────
   /**
@@ -1417,10 +1471,16 @@ export default function App() {
     copy.userData.hasHandle = ud.hasHandle !== false;
     copy.userData.frontMatId = ud.frontMatId || ud.matId;
     copy.userData.label = ud.label + " (cópia)";
+    // Copia propriedades de porta
+    if (ud.typeId === "porta") {
+      copy.userData.doorSide = ud.doorSide || "left";
+      copy.userData.doorType = ud.doorType || "hinged";
+    }
 
     // Aplica posição Y: centro = base + h/2 (igual ao que makePiece faz internamente)
     copy.position.y = baseY + (ud.h || 0) / 2;
-    copy.userData.baseX = ox;
+    // FIX #5: baseX sempre copiado (inclusive portas) para evitar salto ao animar
+    copy.userData.baseX = copy.position.x;
     copy.userData.baseZ = oz;
     copy.userData.baseRY = 0;
 
@@ -1458,7 +1518,7 @@ export default function App() {
    */
   const updateDim = useCallback((axis, valCm) => {
     const obj = selRef.current; if (!obj) return;
-    const v = Math.max(0.1, parseFloat(valCm) || 1) / 100;
+    const _p = parseFloat(valCm); const v = Math.max(0.001, (isNaN(_p) ? 1 : _p) / 100); // FIX #6
     obj.userData[axis] = v;
     rebuildPiece(obj);
     // BUG 8 FIX: recriar outline completo (tamanho + posição) ao redimensionar
@@ -1466,7 +1526,8 @@ export default function App() {
     addOutline(obj, sceneRef.current);
     const ol = sceneRef.current?.children?.find(c => c.userData[OUTLINE_TAG]);
     if (ol) ol.material.color.set(obj.userData.locked ? 0xff8800 : 0x44aaff);
-    setSelData(d => ({...d, [axis]:v}));
+    const _newPy = Math.round((obj.position.y-(obj.userData.h||v)/2)*100);
+    setSelData(d => ({...d, [axis]:v, py: axis==="h" ? _newPy : (d?.py??0)}));
     setStatus(`📐 ${axis.toUpperCase()}: ${Math.round(v*100)}cm`);
   }, []);
 
@@ -1618,25 +1679,51 @@ export default function App() {
     setStatus(nowLocked ? `🔒 ${obj.userData.label} bloqueada` : `🔓 ${obj.userData.label} desbloqueada`);
   }, []);
 
+  // ── ALTURA DO PUXADOR ────────────────────────────────────────
+  /**
+   * Atualiza a posição vertical (Y local) do puxador da peça selecionada.
+   * @param {number} yCm - Deslocamento em cm a partir do centro da peça (pode ser negativo)
+   */
+  const updateHandleY = useCallback((yCm) => {
+    const obj = selRef.current; if (!obj?.userData) return;
+    const handle = obj.children.find(c => c.userData.isHandle); if (!handle) return;
+    const parsed = parseFloat(yCm);
+    const yM = isNaN(parsed) ? 0 : parsed / 100;
+    // Limitar: não pode sair da peça (± metade da altura)
+    const clamp = Math.max(-(obj.userData.h/2 - 0.02), Math.min(obj.userData.h/2 - 0.02, yM));
+    handle.position.y = clamp;
+    obj.userData.handleY = clamp;
+    setSelData(d => ({...d, handleY: clamp}));
+    setStatus(`🔩 Puxador: ${Math.round(clamp*100)}cm do centro`);
+  }, []);
+
   // ── TOGGLE LADO DA PORTA ──────────────────────────────────────
   // BUG 6 FIX: aceita lado explícito ("left"|"right") em vez de sempre alternar.
   // Quando chamado sem argumento, mantém comportamento de toggle (compatibilidade).
   const toggleDoorSide = useCallback((forceSide) => {
     const obj = selRef.current; if (!obj?.userData) return;
     if (obj.userData.typeId !== "porta") return;
-    // Se estiver aberta, fecha primeiro
-    if (obj.userData.isOpen) {
-      obj.userData.isOpen = false;
-      obj.userData.openProgress = 0;
-      obj.position.x = obj.userData.baseX;
-      obj.position.z = obj.userData.baseZ;
-      obj.rotation.y = obj.userData.baseRY;
-      animSet.delete(obj);
-    }
+    obj.userData.isOpen = false;
+    obj.userData.openProgress = 0;
+    obj.position.x = obj.userData.baseX;
+    obj.position.z = obj.userData.baseZ;
+    obj.rotation.y = obj.userData.baseRY;
+    animSet.delete(obj);
     const newSide = forceSide || (obj.userData.doorSide === "right" ? "left" : "right");
     obj.userData.doorSide = newSide;
+    // Recalcular pivot do grupo para o novo lado da dobradica
+    const _w = obj.userData.w;
+    const _prevSide = newSide === "left" ? "right" : "left";
+    const _centerX = _prevSide === "left" ? obj.userData.baseX - _w/2 : obj.userData.baseX + _w/2;
+    const _newBaseX = newSide === "left" ? _centerX + _w/2 : _centerX - _w/2;
+    obj.userData.baseX = _newBaseX;
+    obj.position.x = _newBaseX;
+    const _cX = newSide === "right" ? _w/2 : -_w/2;
+    obj.children.forEach(c => {
+      if (c.userData.isBody || c.userData.isTrack || c.userData.isHandle) c.position.x = _cX;
+    });
     setSelData(d => ({...d, doorSide: newSide, isOpen: false}));
-    setStatus(`🚪 Dobradiça: ${newSide === "left" ? "Esquerda" : "Direita"}`);
+    setStatus(`🚪 Dobraça: ${newSide === "left" ? "Direita" : "Esquerda"}`);
   }, []);
 
   /**
@@ -1663,6 +1750,15 @@ export default function App() {
     // Mostra/oculta canaletas
     const track = obj.children.find(c => c.userData.isTrack);
     if (track) track.visible = (newType === "sliding");
+    // Reconstrói o puxador: posição Z muda entre dobradiça (face da porta) e correr (centro)
+    const oldH = obj.children.find(c => c.userData.isHandle);
+    if (oldH) {
+      oldH.traverse(c => { if (c.isMesh) { c.geometry.dispose(); c.material.dispose(); } });
+      obj.remove(oldH);
+    }
+    const newH = makeHandle(obj.userData.w, obj.userData.h, obj.userData.d);
+    newH.visible = obj.userData.hasHandle !== false;
+    obj.add(newH);
     setSelData(d => ({...d, doorType: newType, isOpen: false}));
     setStatus(newType === "sliding" ? `🛤 Porta de correr (canaleta)` : `🚪 Porta de abrir (dobradiça)`);
   }, []);
@@ -1813,11 +1909,11 @@ export default function App() {
                       style={{flexShrink:0,fontSize:11,color:"#3a5a7a",padding:"1px 4px",
                         borderRadius:3,cursor:"pointer",
                         background:selId===p.id?"#1e3a5a":"transparent"}}>✏</span>
-                    <span onClick={e=>{e.stopPropagation();selFromList(p.id);setTimeout(dupSel,30);}} title="Duplicar"
+                    <span onClick={e=>{e.stopPropagation();const _o=piecesRef.current.find(o=>o.userData.id===p.id);if(_o){selRef.current=_o;dupSel();}}} title="Duplicar" /* FIX #8 */
                       style={{flexShrink:0,fontSize:11,color:"#3a6a4a",padding:"1px 4px",
                         borderRadius:3,cursor:"pointer",
                         background:selId===p.id?"#1a3a2a":"transparent"}}>📋</span>
-                    <span onClick={e=>{e.stopPropagation();selFromList(p.id);setTimeout(toggleLock,30);}} title={p.locked?"Desbloquear":"Bloquear"}
+                    <span onClick={e=>{e.stopPropagation();const _o=piecesRef.current.find(o=>o.userData.id===p.id);if(_o){selRef.current=_o;toggleLock();}}} title={p.locked?"Desbloquear":"Bloquear"} /* FIX #8 */
                       style={{flexShrink:0,fontSize:11,padding:"1px 4px",borderRadius:3,cursor:"pointer",
                         color:p.locked?"#ff8800":"#3a5a6a",
                         background:p.locked?"#2a1800":selId===p.id?"#1a2a3a":"transparent"}}>
@@ -1951,12 +2047,57 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Altura do puxador — só quando hasHandle está ativo */}
+                {selData.hasHandle && (
+                  <div style={{marginTop:6,padding:"8px 10px",background:"#0e0e18",
+                    border:"1px solid #2a2a3a",borderRadius:6}}>
+                    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+                      <span style={{fontSize:11}}>🔩</span>
+                      <div style={{fontSize:9,letterSpacing:1,color:"#3a5a7a",textTransform:"uppercase",flex:1}}>
+                        Altura do Puxador
+                      </div>
+                      <div style={{fontSize:10,color:"#c8a040",fontFamily:"monospace",minWidth:48,textAlign:"right"}}>
+                        {selData.handleY !== undefined ? (selData.handleY*100).toFixed(1) : "0.0"} cm
+                      </div>
+                    </div>
+                    {/* Slider de posição vertical */}
+                    <input
+                      type="range"
+                      min={Math.round(-(selData.h/2 - 0.02)*100)}
+                      max={Math.round((selData.h/2 - 0.02)*100)}
+                      step={1}
+                      value={Math.round((selData.handleY !== undefined ? selData.handleY : 0)*100)}
+                      onChange={e => updateHandleY(e.target.value)}
+                      style={{width:"100%",accentColor:"#c8a040",cursor:"pointer",height:4}}
+                    />
+                    <div style={{display:"flex",justifyContent:"space-between",marginTop:3,fontSize:8,color:"#2a4a5a"}}>
+                      <span>↓ Base</span>
+                      <span>● Centro</span>
+                      <span>Topo ↑</span>
+                    </div>
+                    {/* Input numérico direto */}
+                    <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6}}>
+                      <div style={{fontSize:9,color:"#4a6a7a",flex:1}}>Posição exata</div>
+                      <input type="number"
+                        step={0.5}
+                        min={Math.round(-(selData.h/2 - 0.02)*100)}
+                        max={Math.round((selData.h/2 - 0.02)*100)}
+                        value={+(selData.handleY !== undefined ? (selData.handleY*100).toFixed(1) : 0)}
+                        onChange={e => updateHandleY(e.target.value)}
+                        style={{width:60,padding:"3px 6px",background:"#080c18",border:"1px solid #2a3a5a",
+                          borderRadius:4,color:"#c8a040",fontSize:11,outline:"none",textAlign:"right"}}
+                      />
+                      <span style={{fontSize:9,color:"#3a5a7a"}}>cm</span>
+                    </div>
+                  </div>
+                )}
+
                 {/* Lado da dobradiça — só porta de abrir */}
                 {selData.typeId==="porta" && selData.doorType!=="sliding" && (
                   <div style={{marginTop:2}}>
-                    <SL>Dobradiça</SL>
+                    <SL>Dobradiça (lado da articulação)</SL>
                     <div style={{display:"flex",gap:4}}>
-                      {[["left","◁ Esquerda"],["right","Direita ▷"]].map(([side,lbl])=>(
+                      {[["right","◁ Esquerda"],["left","Direita ▷"]].map(([side,lbl])=>(
                         <div key={side} onClick={()=>{
                           // BUG 6 FIX: setar lado diretamente (não alternar) — evita comportamento inesperado
                           toggleDoorSide(side);
@@ -1965,7 +2106,7 @@ export default function App() {
                           background:selData.doorSide===side?"#1a2838":"#101018",
                           border:`2px solid ${selData.doorSide===side?"#4a8aaa":"#2a2a3a"}`,
                           transition:"all 0.15s"}}>
-                          <div style={{fontSize:14}}>{side==="left"?"🚪⬅":"➡🚪"}</div>
+                          <div style={{fontSize:14}}>{side==="right"?"⬅🚪":"🚪➡"}</div>
                           <div style={{fontSize:9,color:selData.doorSide===side?"#80c0e0":"#506070",marginTop:2}}>{lbl}</div>
                         </div>
                       ))}
@@ -2530,7 +2671,7 @@ function CutTab({pieces: _piecesState, prices, setPrices, piecesRef, selFromList
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
     a.href = url; a.download = `plano_corte_${new Date().toISOString().slice(0,10)}.txt`;
-    a.click(); URL.revokeObjectURL(url);
+    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); // FIX #12
   };
 
   const priceFields = [
@@ -2590,7 +2731,7 @@ function CutTab({pieces: _piecesState, prices, setPrices, piecesRef, selFromList
                     </div>
                     {/* Botão de bloqueio */}
                     <div
-                      onClick={() => { selFromList(p.id); setTimeout(toggleLock, 40); }}
+                      onClick={() => { selFromList(p.id); toggleLock(); }} /* FIX #8 */
                       title={p.locked ? "Desbloquear peça" : "Bloquear peça"}
                       style={{
                         display:"flex",alignItems:"center",justifyContent:"center",
