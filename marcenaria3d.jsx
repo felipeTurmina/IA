@@ -293,34 +293,78 @@ const PTYPES = [
  * @param {number} pD - Profundidade da peça-pai em metros
  * @returns {THREE.Group} Grupo com todos os meshes do puxador
  */
-function makeHandle(pW, pH, pD, handleY) {
+/**
+ * Constrói e posiciona o puxador com PONTO FIXO de referência.
+ *
+ * Para PORTA: o handle é filho do GRUPO (mesmo nível que o body).
+ *   - doorSide "left"  → dobradiça à direita → body.position.x = -w/2
+ *                         puxador na borda ESQUERDA: groupX = -w + margem
+ *   - doorSide "right" → dobradiça à esquerda → body.position.x = +w/2
+ *                         puxador na borda DIREITA: groupX = +w - margem
+ *   - faceZ em coords do grupo = d/2 (face frontal do body, pois body.z=0)
+ *
+ * Para GAVETA: o handle é filho do FRONT (painel frontal destacado).
+ *   - refX = 0 (centro horizontal do front)
+ *   - faceZ local ao front = frontT/2 + offset
+ *
+ * handleX, handleY = offsets em metros relativos ao ponto fixo (positivo = centro/cima)
+ * handleAngle = rotação em graus
+ *
+ * Retorna o handle criado.
+ */
+function attachHandle(parent, pW, pH, slabD, typeId, doorSide, handleX, handleY, handleAngle) {
+  // Remove handle anterior se existir
+  const old = parent.children?.find(c => c.userData.isHandle);
+  if (old) { old.traverse(c=>{ if(c.isMesh){c.geometry.dispose();c.material.dispose();} }); parent.remove(old); }
+
   const g = new THREE.Group();
   g.userData.isHandle = true;
+
+  // Geometria do puxador
   const barW = Math.min(pW * 0.55, 0.18);
-  const metalMat = new THREE.MeshStandardMaterial({color:0xc8c8c8, roughness:0.15, metalness:0.92});
-  // barra
-  const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.006,0.006,barW,10), metalMat);
+  const mat  = new THREE.MeshStandardMaterial({color:0xc8c8c8, roughness:0.15, metalness:0.92});
+  const bar  = new THREE.Mesh(new THREE.CylinderGeometry(0.006,0.006,barW,10), mat);
   bar.rotation.z = Math.PI/2;
-  // suportes
   const legH = 0.025;
   const legGeo = new THREE.CylinderGeometry(0.005,0.005,legH,10);
-  const legL = new THREE.Mesh(legGeo, metalMat); legL.rotation.x = Math.PI/2;
-  const legR = new THREE.Mesh(legGeo, metalMat); legR.rotation.x = Math.PI/2;
+  const legL = new THREE.Mesh(legGeo, mat); legL.rotation.x = Math.PI/2;
+  const legR = new THREE.Mesh(legGeo, mat); legR.rotation.x = Math.PI/2;
   legL.position.set(-barW/2, 0, -legH/2);
   legR.position.set( barW/2, 0, -legH/2);
-  // rosetas
   const rosGeo = new THREE.CylinderGeometry(0.009,0.009,0.005,12);
-  const rosL = new THREE.Mesh(rosGeo, metalMat); rosL.rotation.x = Math.PI/2;
-  const rosR = new THREE.Mesh(rosGeo, metalMat); rosR.rotation.x = Math.PI/2;
+  const rosL = new THREE.Mesh(rosGeo, mat); rosL.rotation.x = Math.PI/2;
+  const rosR = new THREE.Mesh(rosGeo, mat); rosR.rotation.x = Math.PI/2;
   rosL.position.set(-barW/2, 0, -(legH+0.001));
   rosR.position.set( barW/2, 0, -(legH+0.001));
   [bar,legL,legR,rosL,rosR].forEach(m=>{ m.castShadow=true; g.add(m); });
-  // handleY = deslocamento vertical em metros a partir do centro da peca
-  // Se nao fornecido: padrao = 0 (centro). Para porta: ~30% da altura acima do centro.
-  const offsetY = (handleY !== undefined && handleY !== null) ? handleY : 0;
-  g.position.set(0, offsetY, pD/2 + legH + 0.004);
+
+  const oX  = (handleX !== undefined && handleX !== null) ? handleX : 0;
+  const oY  = (handleY !== undefined && handleY !== null) ? handleY : 0;
+  const ang = handleAngle ? THREE.MathUtils.degToRad(handleAngle) : 0;
+
+  let refX, refY, refZ;
+
+  if (typeId === "porta") {
+    // parent = grupo da porta (origem = dobradiça)
+    // body.position.x = doorSide=="left" ? -w/2 : +w/2  (centro do body no grupo)
+    // PONTO FIXO PADRÃO: centro X do body + 30% da altura acima do centro
+    refX = doorSide === "right" ? pW/2 : -pW/2;  // centro do body em coords do grupo
+    refY = pH * 0.30;                              // 30% acima do centro (padrão ergonômico)
+    refZ = slabD/2 + legH + 0.004;                // face frontal (body.z=0, face=+d/2)
+  } else {
+    // GAVETA: parent = front, refX/Y em coords locais do front
+    refX = 0;   // centro horizontal
+    refY = 0;   // centro vertical
+    refZ = slabD/2 + legH + 0.004;
+  }
+
+  // refX/refY = ponto fixo padrão; oX/oY = offset adicional do usuário
+  g.position.set(refX + oX, refY + oY, refZ);
+  g.rotation.z = ang;
+  parent.add(g);
   return g;
 }
+
 
 /**
  * Cria as canaletas (trilhos) de uma porta de correr como THREE.Group.
@@ -464,16 +508,22 @@ function makePiece(typeId, matId, x=0, y=0, z=0) {
       grp.add(track);
     }
 
-    // handleY default: para porta = 30% da altura acima do centro; gaveta = 0 (centro)
-    const defaultHandleY = typeId === "porta" ? h * 0.30 : 0;
-    const handle = makeHandle(w, h, d, defaultHandleY);
-    handle.position.x = -w/2; // puxador acompanha o body
-    grp.add(handle);
+    // Puxador: para PORTA o parent é o grupo (coords do grupo = body.pos + local)
+    //           para GAVETA o parent é o front (coords locais do front)
+    {
+      const _slabD0 = typeId === "gaveta" ? 0.018 : d;
+      if (typeId === "gaveta") {
+        const _hFront = grp.children.find(c => c.userData.isFront);
+        if (_hFront) attachHandle(_hFront, w, h, _slabD0, typeId, "left", 0, 0, 0);
+      } else {
+        // Porta: handle filho do grupo, refX calculado em coords do grupo
+        attachHandle(grp, w, h, _slabD0, typeId, "left", 0, 0, 0);
+      }
+    }
 
     // Grupo posicionado na borda direita da porta (dobradica padrao "left")
     grp.position.set(x + w/2, y+h/2, z);
 
-    const _defHandleY = typeId === "porta" ? h * 0.30 : 0;
     grp.userData = {
       id, typeId, matId:mid,
       frontMatId: mid,
@@ -483,7 +533,10 @@ function makePiece(typeId, matId, x=0, y=0, z=0) {
       isOpen:false, openProgress:0,
       baseX:x + (typeId==="porta" ? w/2 : 0), baseZ:z, baseRY:0,
       hasHandle: true,
-      handleY: _defHandleY,
+      handleY: 0,  // offset relativo ao ponto fixo (0 = ponto fixo padrão)
+      handleX: 0,
+      handleAngle: 0,
+      slabD: typeId === "gaveta" ? 0.018 : d,  // espessura da face onde o puxador está fixado
       doorSide: "left",
       doorType: "hinged",
     };
@@ -540,19 +593,7 @@ function rebuildPiece(obj) {
       front.position.z = (bodyD / 2) - (frontT / 2) + frontT;
       front.material = buildMat(frontMatId || matId, w, h);
     }
-    // rebuild handle
-    const oldH = obj.children.find(c=>c.userData.isHandle);
-    if (oldH) {
-      oldH.traverse(c=>{ if(c.isMesh){c.geometry.dispose(); c.material.dispose();} });
-      obj.remove(oldH);
-    }
-    const newH = makeHandle(w, h, d, obj.userData.handleY !== undefined ? obj.userData.handleY : (obj.userData.typeId==="porta" ? h*0.30 : 0));
-    newH.visible = obj.userData.hasHandle !== false;
-    // Reposicionar X do handle conforme doorSide
-    if (obj.userData.typeId === "porta") {
-      newH.position.x = obj.userData.doorSide === "right" ? w/2 : -w/2;
-    }
-    obj.add(newH);
+    // Reposicionar body e track (porta) ou reconstruir track
     if (typeId === "porta") {
       const oldT = obj.children.find(c=>c.userData.isTrack);
       if (oldT) {
@@ -561,12 +602,33 @@ function rebuildPiece(obj) {
       }
       const newT = makeTrack(w, h, d);
       newT.visible = obj.userData.doorType === "sliding";
-      obj.add(newT);
-      // Reposicionar filhos com offset correto para o doorSide atual
-      const _cX = obj.userData.doorSide === "right" ? w/2 : -w/2;
-      obj.children.forEach(c => {
-        if (c.userData.isBody || c.userData.isTrack || c.userData.isHandle) c.position.x = _cX;
+      // body e track seguem o doorSide
+      const _side = obj.userData.doorSide || "left";
+      const _cX   = _side === "right" ? w/2 : -w/2;
+      obj.children.forEach(ch => {
+        if (ch.userData.isBody || ch.userData.isTrack) ch.position.x = _cX;
       });
+      newT.position.x = _cX;
+      obj.add(newT);
+    }
+    // Recolocar puxador — porta: filho do grupo; gaveta: filho do front
+    {
+      const _rb_slabD = obj.userData.slabD || d;
+      const _rb_side  = obj.userData.doorSide || "left";
+      const _rb_hX = obj.userData.handleX  !== undefined ? obj.userData.handleX  : 0;
+      const _rb_hY = obj.userData.handleY  !== undefined ? obj.userData.handleY  : 0;
+      const _rb_hA = obj.userData.handleAngle || 0;
+      let h_;
+      if (typeId === "gaveta") {
+        const _rb_front = obj.children.find(c=>c.userData.isFront);
+        if (_rb_front) h_ = attachHandle(_rb_front, w, h, _rb_slabD, typeId, _rb_side, _rb_hX, _rb_hY, _rb_hA);
+      } else {
+        // Remove handle antigo do grupo antes de recriar
+        const _rb_oldH = obj.children.find(c=>c.userData.isHandle);
+        if (_rb_oldH) { _rb_oldH.traverse(c=>{if(c.isMesh){c.geometry.dispose();c.material.dispose();}}); obj.remove(_rb_oldH); }
+        h_ = attachHandle(obj, w, h, _rb_slabD, typeId, _rb_side, _rb_hX, _rb_hY, _rb_hA);
+      }
+      if (h_) h_.visible = obj.userData.hasHandle !== false;
     }
   } else {
     obj.geometry.dispose();
@@ -765,15 +827,14 @@ function getOutlineBox(obj) {
  * @param {THREE.Object3D} obj   - Peça selecionada
  * @param {THREE.Scene}    scene - Cena Three.js
  */
-function addOutline(obj, scene) {
-  clearOutline(scene);
+function addOutline(obj, scene, outlineRef) {
+  clearOutline(scene, outlineRef);
   const { size, center } = getOutlineBox(obj);
   const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
   const edges = new THREE.EdgesGeometry(geo);
   geo.dispose();
   const ol = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({color:0x44aaff, depthTest:false}));
   ol.position.copy(center);
-  // Para porta: o outline deve rotacionar junto com a porta (em torno do proprio centro)
   if (obj.userData && obj.userData.typeId === "porta") {
     ol.rotation.copy(obj.rotation);
   } else {
@@ -782,15 +843,17 @@ function addOutline(obj, scene) {
   ol.userData[OUTLINE_TAG] = true;
   ol.renderOrder = 999;
   scene.add(ol);
+  if (outlineRef) outlineRef.current = ol;
 }
 
 /**
  * Remove o outline atual da cena e descarta geometria/material.
  * @param {THREE.Scene} scene
  */
-function clearOutline(scene) {
-  const ol = scene.children.find(c=>c.userData[OUTLINE_TAG]);
+function clearOutline(scene, outlineRef) {
+  const ol = outlineRef?.current || scene.children.find(c=>c.userData[OUTLINE_TAG]);
   if (ol) { ol.geometry.dispose(); ol.material.dispose(); scene.remove(ol); }
+  if (outlineRef) outlineRef.current = null;
 }
 
 /**
@@ -801,11 +864,9 @@ function clearOutline(scene) {
  * @param {THREE.Object3D} obj   - Peça sendo movida
  * @param {THREE.Scene}    scene - Cena Three.js
  */
-function syncOutline(obj, scene) {
-  const ol = scene.children.find(c=>c.userData[OUTLINE_TAG]);
+function syncOutline(obj, scene, outlineRef) {
+  const ol = outlineRef?.current || scene.children.find(c=>c.userData[OUTLINE_TAG]);
   if (!ol) return;
-  // Sempre usar getOutlineBox para calcular center correto
-  // (porta: origin e dobradica, nao centro visual)
   const { center } = getOutlineBox(obj);
   ol.position.copy(center);
 }
@@ -980,6 +1041,10 @@ export default function App() {
   const piecesRef  = useRef([]);
   /** Referência à peça atualmente selecionada (ou null) */
   const selRef     = useRef(null);
+  /** Referência direta ao outline (evita scene.children.find a cada frame) */
+  const outlineRef = useRef(null);
+  /** Vector3 pré-alocado para drag — evita GC pressure durante mousemove */
+  const _dragPt    = useRef(new THREE.Vector3());
 
   // ── Refs de câmera (coordenadas esféricas) ───────────────────────────────
   /**
@@ -1113,22 +1178,23 @@ export default function App() {
     // Grade: 8m / 8000 divisões = 1mm por quadrado
     scene.add(new THREE.GridHelper(8, 400, 0x2a2a50, 0x1a1a38)); // FIX #4: era 8000, travava
 
-    // Animate loop
+    // Animate loop — render-on-demand: só renderiza quando algo mudou
     let fid, last = performance.now();
+    let needsRender = true;
+    rendRef._needsRender = () => { needsRender = true; };
     const loop = () => {
       fid = requestAnimationFrame(loop);
       const now = performance.now();
       const dt = Math.min((now - last) / 1000, 0.05);
       last = now;
+      const hadAnim = animSet.size > 0;
       tickAnimations(dt);
-      // Sincronizar outline com a peca selecionada a cada frame
       const selNow = selRef.current;
-      if (selNow) {
-        const ol = scene.children.find(c=>c.userData[OUTLINE_TAG]);
+      if (hadAnim && selNow) {
+        const ol = outlineRef.current;
         if (ol) {
           const {center} = getOutlineBox(selNow);
           ol.position.copy(center);
-          // Porta: outline rotaciona junto com a porta
           if (selNow.userData && selNow.userData.typeId === "porta") {
             ol.rotation.copy(selNow.rotation);
           } else {
@@ -1136,7 +1202,10 @@ export default function App() {
           }
         }
       }
-      renderer.render(scene, camera);
+      if (needsRender || hadAnim || animSet.size > 0) {
+        renderer.render(scene, camera);
+        needsRender = false;
+      }
     };
     loop();
 
@@ -1147,6 +1216,7 @@ export default function App() {
       const {theta,phi,radius,cx,cy,cz} = sph.current;
       camera.position.set(cx+radius*Math.sin(phi)*Math.sin(theta), cy+radius*Math.cos(phi), cz+radius*Math.sin(phi)*Math.cos(theta));
       camera.lookAt(cx,cy,cz);
+      rendRef._needsRender();
     };
     renderer.domElement.addEventListener("wheel", _wh, {passive:false});
     const onResize = () => {
@@ -1195,15 +1265,15 @@ export default function App() {
   const selectObj = useCallback((obj) => {
     selRef.current = obj;
     if (!obj) {
-      clearOutline(sceneRef.current);
+      clearOutline(sceneRef.current, outlineRef);
       setSelId(null); setSelData(null);
       setStatus("Clique em uma peça para selecionar");
       return;
     }
-    addOutline(obj, sceneRef.current);
+    addOutline(obj, sceneRef.current, outlineRef);
     const ud = obj.userData;
     // Outline laranja = bloqueada, azul = livre
-    const ol = sceneRef.current?.children?.find(c => c.userData[OUTLINE_TAG]);
+    const ol = outlineRef.current;
     if (ol) ol.material.color.set(ud.locked ? 0xff8800 : 0x44aaff);
     setSelId(ud.id);
     setSelData({
@@ -1211,6 +1281,8 @@ export default function App() {
       py: Math.round((obj.position.y - (ud.h||0)/2) * 100), // base do chão em cm
       hasHandle: ud.hasHandle !== false,
       handleY: ud.handleY !== undefined ? ud.handleY : (ud.typeId === "porta" ? (ud.h||0.7)*0.30 : 0),
+      handleX: ud.handleX !== undefined ? ud.handleX : 0,
+      handleAngle: ud.handleAngle || 0,
       frontMatId: ud.frontMatId || ud.matId,
       doorSide: ud.doorSide || "left",
       doorType: ud.doorType || "hinged",
@@ -1220,6 +1292,7 @@ export default function App() {
     if (ud.typeId !== "gaveta") setMatTarget("corpo");
     setTab(t => (t==="add"||t==="edit"||t==="mat") ? "edit" : t); // FIX #9: auto-tab
     setStatus(ud.locked ? `🔒 ${ud.label} (bloqueada)` : `✓ ${ud.label}`);
+    rendRef._needsRender();
   }, []);
 
   // ── COORDENADAS NDC ───────────────────────────────────────────────────────
@@ -1297,7 +1370,7 @@ export default function App() {
       sph.current.theta -= dx * 0.007;
       sph.current.phi = Math.max(0.06, Math.min(1.54, sph.current.phi + dy * 0.007));
       orbit.current.lx = e.clientX; orbit.current.ly = e.clientY;
-      updateCam(); return;
+      updateCam(); rendRef._needsRender(); return;
     }
     if (panS.current.on) {
       const dx = e.clientX - panS.current.lx, dy = e.clientY - panS.current.ly;
@@ -1307,29 +1380,25 @@ export default function App() {
       sph.current.cz -= right.z * dx * 0.003;
       sph.current.cy += dy * 0.003;
       panS.current.lx = e.clientX; panS.current.ly = e.clientY;
-      updateCam(); return;
+      updateCam(); rendRef._needsRender(); return;
     }
     if (dragS.current.on && selRef.current) {
       rc.current.setFromCamera(getNDC(e), cameraRef.current);
-      const pt = new THREE.Vector3();
+      const pt = _dragPt.current;
       if (rc.current.ray.intersectPlane(dplane.current, pt)) {
         const obj = selRef.current;
         const prevX = obj.position.x;
         const prevZ = obj.position.z;
 
-        // Movimento livre durante o drag — sem snapGrid para máxima suavidade
         obj.position.x = pt.x + (dragS.current.ox || 0);
         obj.position.z = pt.z + (dragS.current.oz || 0);
 
-        // Snap magnético entre bordas de peças (leve — usa userData, não Box3)
         edgeSnap(obj, piecesRef.current);
 
-        // Colisão: se colidir com outra peça, reverte posição
-        // BUG 5 FIX: peças bloqueadas agora funcionam como obstáculo (colisão com elas é verificada)
         if (colisionOn) {
           const box = fastBox(obj);
           const collides = piecesRef.current.some(o => {
-            if (o === obj) return false; // não colide consigo mesmo
+            if (o === obj) return false;
             return box.intersectsBox(fastBox(o));
           });
           if (collides) {
@@ -1338,7 +1407,8 @@ export default function App() {
           }
         }
 
-        syncOutline(obj, sceneRef.current);
+        syncOutline(obj, sceneRef.current, outlineRef);
+        rendRef._needsRender();
       }
     }
   }, [getNDC, updateCam, colisionOn]);
@@ -1369,7 +1439,7 @@ export default function App() {
           obj.userData.baseRY = obj.rotation.y;
         }
       }
-      syncOutline(obj, sceneRef.current);
+      syncOutline(obj, sceneRef.current, outlineRef);
     }
     dragS.current = {on:false, ox:0, oz:0};
     orbit.current = {on:false};
@@ -1408,6 +1478,7 @@ export default function App() {
     piecesRef.current.push(obj);
     setPieces(prev => [...prev, {id:obj.userData.id, label:obj.userData.label, typeId:obj.userData.typeId}]);
     selectObj(obj);
+    rendRef._needsRender();
     setStatus(`➕ ${obj.userData.label} adicionado`);
   }, [actMat, actType, selectObj]);
 
@@ -1420,7 +1491,7 @@ export default function App() {
    */
   const delSel = useCallback(() => {
     const obj = selRef.current; if (!obj) return;
-    clearOutline(sceneRef.current);
+    clearOutline(sceneRef.current, outlineRef);
     animSet.delete(obj);
     sceneRef.current.remove(obj);
     // Fix memory leak: descarta textura (map) antes do material
@@ -1438,6 +1509,7 @@ export default function App() {
     piecesRef.current = piecesRef.current.filter(p => p !== obj);
     setPieces(prev => prev.filter(p => p.id !== obj.userData.id));
     selectObj(null);
+    rendRef._needsRender();
     setStatus("🗑 Peça removida");
   }, [selectObj]);
 
@@ -1469,6 +1541,8 @@ export default function App() {
     copy.userData.ry = ud.ry || 0;
     copy.userData.rz = ud.rz || 0;
     copy.userData.hasHandle = ud.hasHandle !== false;
+    copy.userData.handleX = ud.handleX || 0;
+    copy.userData.handleAngle = ud.handleAngle || 0;
     copy.userData.frontMatId = ud.frontMatId || ud.matId;
     copy.userData.label = ud.label + " (cópia)";
     // Copia propriedades de porta
@@ -1493,16 +1567,20 @@ export default function App() {
       if (front) { front.material.dispose(); front.material = buildMat(ud.frontMatId, ud.w, ud.h); }
     }
 
-    // Visibilidade do puxador
+    // Visibilidade do pivot do puxador
     if (copy.isGroup) {
-      const handle = copy.children.find(c => c.userData.isHandle);
-      if (handle) handle.visible = ud.hasHandle !== false;
+      // handle é filho do body — usar traverse
+      // porta: handle filho do grupo; gaveta: filho do front
+      let _dh = copy.children.find(c => c.userData.isHandle);
+      if (!_dh) { const _df = copy.children.find(c => c.userData.isFront); if (_df) _dh = _df.children.find(c => c.userData.isHandle); }
+      if (_dh) _dh.visible = ud.hasHandle !== false;
     }
 
     sceneRef.current.add(copy);
     piecesRef.current.push(copy);
     setPieces(prev => [...prev, {id:copy.userData.id, label:copy.userData.label, typeId:copy.userData.typeId}]);
     selectObj(copy);
+    rendRef._needsRender();
     setStatus(`📋 ${copy.userData.label}`);
   }, [selectObj]);
 
@@ -1523,11 +1601,12 @@ export default function App() {
     rebuildPiece(obj);
     // BUG 8 FIX: recriar outline completo (tamanho + posição) ao redimensionar
     // syncOutline só atualizava posição, deixando o contorno com tamanho desatualizado
-    addOutline(obj, sceneRef.current);
-    const ol = sceneRef.current?.children?.find(c => c.userData[OUTLINE_TAG]);
+    addOutline(obj, sceneRef.current, outlineRef);
+    const ol = outlineRef.current;
     if (ol) ol.material.color.set(obj.userData.locked ? 0xff8800 : 0x44aaff);
     const _newPy = Math.round((obj.position.y-(obj.userData.h||v)/2)*100);
     setSelData(d => ({...d, [axis]:v, py: axis==="h" ? _newPy : (d?.py??0)}));
+    rendRef._needsRender();
     setStatus(`📐 ${axis.toUpperCase()}: ${Math.round(v*100)}cm`);
   }, []);
 
@@ -1548,8 +1627,9 @@ export default function App() {
     deg = ((deg % 360) + 540) % 360 - 180;
     obj.userData[axis] = deg;
     obj.rotation[axis.slice(1)] = THREE.MathUtils.degToRad(deg);
-    syncOutline(obj, sceneRef.current);
+    syncOutline(obj, sceneRef.current, outlineRef);
     setSelData(d => ({...d, [axis]: Math.round(deg)}));
+    rendRef._needsRender();
     setStatus(`🔄 ${axis.toUpperCase()}: ${Math.round(deg)}°`);
   }, []);
 
@@ -1572,7 +1652,7 @@ export default function App() {
     if (obj.userData) {
       obj.userData.baseY = obj.position.y;
     }
-    syncOutline(obj, sceneRef.current);
+    syncOutline(obj, sceneRef.current, outlineRef);
     setSelData(d => ({...d, py: Math.round(baseCm)}));
   }, []);
 
@@ -1605,6 +1685,7 @@ export default function App() {
     }
     setSelData(d => ({...d, matId:mid}));
     const label = ALL_MAT_ITEMS.find(m=>m.id===mid)?.label || MATS_GLASS.find(m=>m.id===mid)?.label || mid;
+    rendRef._needsRender();
     setStatus(`🎨 ${label}`);
   }, []);
 
@@ -1627,6 +1708,7 @@ export default function App() {
     }
     setSelData(d => ({...d, frontMatId: mid}));
     const label = ALL_MAT_ITEMS.find(m=>m.id===mid)?.label || mid;
+    rendRef._needsRender();
     setStatus(`🎨 Frente: ${label}`);
   }, []);
   /**
@@ -1637,6 +1719,7 @@ export default function App() {
     const obj = selRef.current; if (!obj) return;
     toggleOpenClose(obj);
     setSelData(d => ({...d, isOpen: obj.userData.isOpen}));
+    rendRef._needsRender();
     setStatus(obj.userData.isOpen ? `🔓 Abrindo ${obj.userData.label}...` : `🔒 Fechando ${obj.userData.label}...`);
   }, []);
 
@@ -1646,12 +1729,19 @@ export default function App() {
    */
   const toggleHandle = useCallback(() => {
     const obj = selRef.current; if (!obj?.isGroup) return;
-    const handle = obj.children.find(c => c.userData.isHandle);
-    if (!handle) return;
-    const nowVisible = handle.visible;
-    handle.visible = !nowVisible;
+    // puxador é filho do body (ou front para gaveta)
+    // porta: handle é filho direto do grupo; gaveta: filho do front
+    let _h = obj.children.find(c => c.userData.isHandle);
+    if (!_h) {
+      const _fr = obj.children.find(c => c.userData.isFront);
+      if (_fr) _h = _fr.children.find(c => c.userData.isHandle);
+    }
+    if (!_h) return;
+    const nowVisible = _h.visible;
+    _h.visible = !nowVisible;
     obj.userData.hasHandle = !nowVisible;
     setSelData(d => ({...d, hasHandle: !nowVisible}));
+    rendRef._needsRender();
     setStatus(!nowVisible ? `🔩 Maçaneta adicionada` : `🚫 Maçaneta removida`);
   }, []);
 
@@ -1669,13 +1759,14 @@ export default function App() {
     const nowLocked = !obj.userData.locked;
     obj.userData.locked = nowLocked;
     // Outline laranja quando bloqueado, azul quando livre
-    const ol = sceneRef.current.children.find(c => c.userData[OUTLINE_TAG]);
+    const ol = outlineRef.current;
     if (ol) ol.material.color.set(nowLocked ? 0xff8800 : 0x44aaff);
     setSelData(d => ({...d, locked: nowLocked}));
     // Atualiza lista de peças para refletir cadeado no nome
     setPieces(prev => prev.map(p =>
       p.id === obj.userData.id ? {...p, locked: nowLocked} : p
     ));
+    rendRef._needsRender();
     setStatus(nowLocked ? `🔒 ${obj.userData.label} bloqueada` : `🔓 ${obj.userData.label} desbloqueada`);
   }, []);
 
@@ -1686,15 +1777,70 @@ export default function App() {
    */
   const updateHandleY = useCallback((yCm) => {
     const obj = selRef.current; if (!obj?.userData) return;
-    const handle = obj.children.find(c => c.userData.isHandle); if (!handle) return;
+    let _h = null; obj.traverse(ch => { if (ch.userData.isHandle) _h = ch; });
+    if (!_h) return;
     const parsed = parseFloat(yCm);
     const yM = isNaN(parsed) ? 0 : parsed / 100;
-    // Limitar: não pode sair da peça (± metade da altura)
-    const clamp = Math.max(-(obj.userData.h/2 - 0.02), Math.min(obj.userData.h/2 - 0.02, yM));
-    handle.position.y = clamp;
+    const maxY = obj.userData.h / 2 - 0.02;
+    const clamp = Math.max(-maxY, Math.min(maxY, yM));
+    // refY (ponto fixo) já está em position.y na criação; aqui só ajustamos o offset
+    // Recria o handle com o novo offset para manter o ponto fixo correto
+    // porta: parent = grupo; gaveta: parent = front
+    const _uhParent = obj.userData.typeId === "gaveta"
+      ? (obj.children.find(ch=>ch.userData.isFront) || obj.children.find(ch=>ch.userData.isBody))
+      : obj; // grupo inteiro para porta
+    if (_uhParent) {
+      const nh = attachHandle(_uhParent, obj.userData.w, obj.userData.h, obj.userData.slabD||obj.userData.d,
+        obj.userData.typeId, obj.userData.doorSide||"left",
+        obj.userData.handleX||0, clamp, obj.userData.handleAngle||0);
+      if (nh) nh.visible = obj.userData.hasHandle !== false;
+    }
     obj.userData.handleY = clamp;
     setSelData(d => ({...d, handleY: clamp}));
-    setStatus(`🔩 Puxador: ${Math.round(clamp*100)}cm do centro`);
+    rendRef._needsRender();
+    setStatus(`🔩 Puxador ↕: ${Math.round(clamp*100)}cm`);
+  }, []);
+
+  // ── POSIÇÃO HORIZONTAL DO PUXADOR (offset relativo ao centro do body) ──
+  const updateHandleX = useCallback((xCm) => {
+    const obj = selRef.current; if (!obj?.userData) return;
+    const parsed = parseFloat(xCm);
+    const xM = isNaN(parsed) ? 0 : parsed / 100;
+    const maxX = obj.userData.w / 2 - 0.02;
+    const clamp = Math.max(-maxX, Math.min(maxX, xM));
+    const _uhParent = obj.userData.typeId === "gaveta"
+      ? (obj.children.find(ch=>ch.userData.isFront) || obj.children.find(ch=>ch.userData.isBody))
+      : obj;
+    if (_uhParent) {
+      const nh = attachHandle(_uhParent, obj.userData.w, obj.userData.h, obj.userData.slabD||obj.userData.d,
+        obj.userData.typeId, obj.userData.doorSide||"left",
+        clamp, obj.userData.handleY||0, obj.userData.handleAngle||0);
+      if (nh) nh.visible = obj.userData.hasHandle !== false;
+    }
+    obj.userData.handleX = clamp;
+    setSelData(d => ({...d, handleX: clamp}));
+    rendRef._needsRender();
+    setStatus(`🔩 Puxador ↔: ${Math.round(clamp*100)}cm`);
+  }, []);
+
+  // ── ROTAÇÃO DO PUXADOR ────────────────────────────────────────
+  const updateHandleAngle = useCallback((deg) => {
+    const obj = selRef.current; if (!obj?.userData) return;
+    const parsed = parseFloat(deg);
+    const angle = isNaN(parsed) ? 0 : ((parsed % 360) + 360) % 360;
+    const _uhParent = obj.userData.typeId === "gaveta"
+      ? (obj.children.find(ch=>ch.userData.isFront) || obj.children.find(ch=>ch.userData.isBody))
+      : obj;
+    if (_uhParent) {
+      const nh = attachHandle(_uhParent, obj.userData.w, obj.userData.h, obj.userData.slabD||obj.userData.d,
+        obj.userData.typeId, obj.userData.doorSide||"left",
+        obj.userData.handleX||0, obj.userData.handleY||0, angle);
+      if (nh) nh.visible = obj.userData.hasHandle !== false;
+    }
+    obj.userData.handleAngle = angle;
+    setSelData(d => ({...d, handleAngle: angle}));
+    rendRef._needsRender();
+    setStatus(`🔩 Puxador ↻: ${Math.round(angle)}°`);
   }, []);
 
   // ── TOGGLE LADO DA PORTA ──────────────────────────────────────
@@ -1720,9 +1866,20 @@ export default function App() {
     obj.position.x = _newBaseX;
     const _cX = newSide === "right" ? _w/2 : -_w/2;
     obj.children.forEach(c => {
-      if (c.userData.isBody || c.userData.isTrack || c.userData.isHandle) c.position.x = _cX;
+      if (c.userData.isBody || c.userData.isTrack) c.position.x = _cX; // pivot posiciona-se via bodyOffsetX
     });
+    // Recolocar puxador no body com o novo doorSide (ponto fixo muda de lado)
+    {
+      // Remove handle antigo do grupo, recriar com novo doorSide
+      const _tdsOldH = obj.children.find(c => c.userData.isHandle);
+      if (_tdsOldH) { _tdsOldH.traverse(c=>{if(c.isMesh){c.geometry.dispose();c.material.dispose();}}); obj.remove(_tdsOldH); }
+      const nh = attachHandle(obj, obj.userData.w, obj.userData.h, obj.userData.slabD||obj.userData.d,
+        "porta", newSide,
+        obj.userData.handleX||0, obj.userData.handleY||0, obj.userData.handleAngle||0);
+      if (nh) nh.visible = obj.userData.hasHandle !== false;
+    }
     setSelData(d => ({...d, doorSide: newSide, isOpen: false}));
+    rendRef._needsRender();
     setStatus(`🚪 Dobraça: ${newSide === "left" ? "Direita" : "Esquerda"}`);
   }, []);
 
@@ -1750,16 +1907,18 @@ export default function App() {
     // Mostra/oculta canaletas
     const track = obj.children.find(c => c.userData.isTrack);
     if (track) track.visible = (newType === "sliding");
-    // Reconstrói o puxador: posição Z muda entre dobradiça (face da porta) e correr (centro)
-    const oldH = obj.children.find(c => c.userData.isHandle);
-    if (oldH) {
-      oldH.traverse(c => { if (c.isMesh) { c.geometry.dispose(); c.material.dispose(); } });
-      obj.remove(oldH);
+    // Reconstrói o puxador preservando posição Y, X e ângulo salvos no userData
+    // Recolocar puxador no body — attachHandle remove o antigo automaticamente
+    {
+      const _tdtOldH = obj.children.find(c => c.userData.isHandle);
+      if (_tdtOldH) { _tdtOldH.traverse(c=>{if(c.isMesh){c.geometry.dispose();c.material.dispose();}}); obj.remove(_tdtOldH); }
+      const nh = attachHandle(obj, obj.userData.w, obj.userData.h, obj.userData.slabD||obj.userData.d,
+        "porta", obj.userData.doorSide||"left",
+        obj.userData.handleX||0, obj.userData.handleY||0, obj.userData.handleAngle||0);
+      if (nh) nh.visible = obj.userData.hasHandle !== false;
     }
-    const newH = makeHandle(obj.userData.w, obj.userData.h, obj.userData.d);
-    newH.visible = obj.userData.hasHandle !== false;
-    obj.add(newH);
     setSelData(d => ({...d, doorType: newType, isOpen: false}));
+    rendRef._needsRender();
     setStatus(newType === "sliding" ? `🛤 Porta de correr (canaleta)` : `🚪 Porta de abrir (dobradiça)`);
   }, []);
   /**
@@ -2030,11 +2189,10 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* Maçaneta/Puxador */}
+                {/* Maçaneta/Puxador — toggle on/off */}
                 <div onClick={toggleHandle} style={{
                   display:"flex",alignItems:"center",gap:10,
                   padding:"9px 12px",borderRadius:7,cursor:"pointer",
-                  marginBottom:selData.typeId==="porta"?6:0,
                   background:selData.hasHandle?"#1a1a14":"#141414",
                   border:`2px solid ${selData.hasHandle?"#7a6a2a":"#3a3a2a"}`,
                   transition:"all 0.2s"}}>
@@ -2047,50 +2205,95 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Altura do puxador — só quando hasHandle está ativo */}
-                {selData.hasHandle && (
-                  <div style={{marginTop:6,padding:"8px 10px",background:"#0e0e18",
-                    border:"1px solid #2a2a3a",borderRadius:6}}>
-                    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
-                      <span style={{fontSize:11}}>🔩</span>
-                      <div style={{fontSize:9,letterSpacing:1,color:"#3a5a7a",textTransform:"uppercase",flex:1}}>
-                        Altura do Puxador
+                {/* Controles de posição e rotação do puxador */}
+                {selData.hasHandle && (() => {
+                  const hY   = selData.handleY   !== undefined ? selData.handleY   : 0;
+                  const hX   = selData.handleX   !== undefined ? selData.handleX   : 0;
+                  const hAng = selData.handleAngle !== undefined ? selData.handleAngle : 0;
+                  const maxY = Math.round((selData.h / 2 - 0.02) * 100);
+                  const maxX = Math.round((selData.w / 2 - 0.02) * 100);
+                  const sliderStyle = {width:"100%",accentColor:"#c8a040",cursor:"pointer",height:4,marginTop:2};
+                  const numStyle    = {width:52,padding:"2px 5px",background:"#080c18",border:"1px solid #2a3a5a",
+                                        borderRadius:4,color:"#c8a040",fontSize:11,outline:"none",textAlign:"right"};
+                  const labelStyle  = {fontSize:9,letterSpacing:1,color:"#3a5a7a",textTransform:"uppercase",flex:1};
+                  const valStyle    = {fontSize:10,color:"#c8a040",fontFamily:"monospace",minWidth:44,textAlign:"right"};
+                  return (
+                    <div style={{marginTop:6,padding:"8px 10px",background:"#0e0e18",
+                      border:"1px solid #2a2a3a",borderRadius:6,display:"flex",flexDirection:"column",gap:8}}>
+
+                      {/* ── Vertical (Y) ── */}
+                      <div>
+                        <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:2}}>
+                          <span style={labelStyle}>↕ Altura</span>
+                          <span style={valStyle}>{(hY*100).toFixed(1)} cm</span>
+                          <input type="number" step={0.5} min={-maxY} max={maxY}
+                            value={+(hY*100).toFixed(1)}
+                            onChange={e => updateHandleY(e.target.value)}
+                            style={numStyle}/>
+                        </div>
+                        <input type="range" min={-maxY} max={maxY} step={1}
+                          value={Math.round(hY*100)}
+                          onChange={e => updateHandleY(e.target.value)}
+                          style={sliderStyle}/>
+                        <div style={{display:"flex",justifyContent:"space-between",fontSize:8,color:"#2a4a5a"}}>
+                          <span>↓ Base</span><span>● Centro</span><span>Topo ↑</span>
+                        </div>
                       </div>
-                      <div style={{fontSize:10,color:"#c8a040",fontFamily:"monospace",minWidth:48,textAlign:"right"}}>
-                        {selData.handleY !== undefined ? (selData.handleY*100).toFixed(1) : "0.0"} cm
+
+                      {/* ── Horizontal (X) ── */}
+                      <div>
+                        <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:2}}>
+                          <span style={labelStyle}>↔ Lateral</span>
+                          <span style={valStyle}>{(hX*100).toFixed(1)} cm</span>
+                          <input type="number" step={0.5} min={-maxX} max={maxX}
+                            value={+(hX*100).toFixed(1)}
+                            onChange={e => updateHandleX(e.target.value)}
+                            style={numStyle}/>
+                        </div>
+                        <input type="range" min={-maxX} max={maxX} step={1}
+                          value={Math.round(hX*100)}
+                          onChange={e => updateHandleX(e.target.value)}
+                          style={sliderStyle}/>
+                        <div style={{display:"flex",justifyContent:"space-between",fontSize:8,color:"#2a4a5a"}}>
+                          <span>◁ Esq</span><span>● Centro</span><span>Dir ▷</span>
+                        </div>
                       </div>
+
+                      {/* ── Rotação (Z) ── */}
+                      <div>
+                        <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:2}}>
+                          <span style={labelStyle}>↻ Rotação</span>
+                          <span style={valStyle}>{Math.round(hAng)}°</span>
+                          <input type="number" step={1} min={0} max={359}
+                            value={Math.round(hAng)}
+                            onChange={e => updateHandleAngle(e.target.value)}
+                            style={numStyle}/>
+                        </div>
+                        <input type="range" min={0} max={359} step={1}
+                          value={Math.round(hAng)}
+                          onChange={e => updateHandleAngle(e.target.value)}
+                          style={sliderStyle}/>
+                        <div style={{display:"flex",justifyContent:"space-between",fontSize:8,color:"#2a4a5a"}}>
+                          <span>0°</span><span>— 180°</span><span>359°</span>
+                        </div>
+                        {/* Atalhos rápidos */}
+                        <div style={{display:"flex",gap:3,marginTop:5}}>
+                          {[[0,"—"],[45,"↗"],[90,"|"],[135,"↘"]].map(([a,lbl])=>(
+                            <div key={a} onClick={()=>updateHandleAngle(a)}
+                              style={{flex:1,textAlign:"center",padding:"3px 0",borderRadius:3,
+                                cursor:"pointer",fontSize:11,fontWeight:700,
+                                background:Math.round(hAng)===a?"#2a1e08":"#0e0e18",
+                                border:`1px solid ${Math.round(hAng)===a?"#c8a040":"#2a2a3a"}`,
+                                color:Math.round(hAng)===a?"#c8a040":"#4a5a6a"}}>
+                              {lbl}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
                     </div>
-                    {/* Slider de posição vertical */}
-                    <input
-                      type="range"
-                      min={Math.round(-(selData.h/2 - 0.02)*100)}
-                      max={Math.round((selData.h/2 - 0.02)*100)}
-                      step={1}
-                      value={Math.round((selData.handleY !== undefined ? selData.handleY : 0)*100)}
-                      onChange={e => updateHandleY(e.target.value)}
-                      style={{width:"100%",accentColor:"#c8a040",cursor:"pointer",height:4}}
-                    />
-                    <div style={{display:"flex",justifyContent:"space-between",marginTop:3,fontSize:8,color:"#2a4a5a"}}>
-                      <span>↓ Base</span>
-                      <span>● Centro</span>
-                      <span>Topo ↑</span>
-                    </div>
-                    {/* Input numérico direto */}
-                    <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6}}>
-                      <div style={{fontSize:9,color:"#4a6a7a",flex:1}}>Posição exata</div>
-                      <input type="number"
-                        step={0.5}
-                        min={Math.round(-(selData.h/2 - 0.02)*100)}
-                        max={Math.round((selData.h/2 - 0.02)*100)}
-                        value={+(selData.handleY !== undefined ? (selData.handleY*100).toFixed(1) : 0)}
-                        onChange={e => updateHandleY(e.target.value)}
-                        style={{width:60,padding:"3px 6px",background:"#080c18",border:"1px solid #2a3a5a",
-                          borderRadius:4,color:"#c8a040",fontSize:11,outline:"none",textAlign:"right"}}
-                      />
-                      <span style={{fontSize:9,color:"#3a5a7a"}}>cm</span>
-                    </div>
-                  </div>
-                )}
+                  );
+                })()}
 
                 {/* Lado da dobradiça — só porta de abrir */}
                 {selData.typeId==="porta" && selData.doorType!=="sliding" && (
@@ -2221,6 +2424,7 @@ export default function App() {
                 if (bestTopY !== null) {
                   // base do moving = topY → posição em cm para updateY
                   updateY(Math.round(bestTopY * 100));
+                  rendRef._needsRender();
                   setStatus("🔝 Encaixado no topo da peça abaixo");
                 } else {
                   setStatus("⚠ Nenhuma peça abaixo — alinhe em X/Z primeiro");
@@ -2731,7 +2935,7 @@ function CutTab({pieces: _piecesState, prices, setPrices, piecesRef, selFromList
                     </div>
                     {/* Botão de bloqueio */}
                     <div
-                      onClick={() => { selFromList(p.id); toggleLock(); }} /* FIX #8 */
+                      onClick={() => { const _o=piecesRef.current.find(o=>o.userData.id===p.id); if(_o){selRef.current=_o; selFromList(p.id); toggleLock();} }}
                       title={p.locked ? "Desbloquear peça" : "Bloquear peça"}
                       style={{
                         display:"flex",alignItems:"center",justifyContent:"center",
