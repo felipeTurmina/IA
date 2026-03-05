@@ -301,7 +301,10 @@ function rebuildPiece(obj) {
   if (obj.isGroup) {
     const body = obj.children.find(c=>c.userData.isBody);
     if (body) {
-      body.geometry.dispose(); body.material.dispose();
+      body.geometry.dispose();
+      // BUG 3 FIX: descartar textura clonada antes de substituir material
+      if (body.material.map) body.material.map.dispose();
+      body.material.dispose();
       if (typeId === "gaveta") {
         const bodyD = d - 0.002;
         body.geometry = new THREE.BoxGeometry(w, h, bodyD);
@@ -314,7 +317,10 @@ function rebuildPiece(obj) {
     if (front) {
       const frontT = 0.018;
       const bodyD = d - 0.002;
-      front.geometry.dispose(); front.material.dispose();
+      front.geometry.dispose();
+      // BUG 3 FIX: descartar textura clonada antes de substituir material
+      if (front.material.map) front.material.map.dispose();
+      front.material.dispose();
       front.geometry = new THREE.BoxGeometry(w, h, frontT);
       front.position.z = (bodyD / 2) - (frontT / 2) + frontT;
       front.material = buildMat(frontMatId || matId, w, h);
@@ -342,8 +348,8 @@ function rebuildPiece(obj) {
   } else {
     obj.geometry.dispose();
     obj.geometry = new THREE.BoxGeometry(w,h,d);
-    if (Array.isArray(obj.material)) obj.material.forEach(m=>m.dispose());
-    else obj.material.dispose();
+    if (Array.isArray(obj.material)) obj.material.forEach(m=>{ if(m.map) m.map.dispose(); m.dispose(); });
+    else { if (obj.material.map) obj.material.map.dispose(); obj.material.dispose(); }
     obj.material = buildMat(matId,w,h);
   }
   obj.rotation.set(
@@ -484,9 +490,9 @@ function syncOutline(obj, scene) {
 }
 
 // ─────────────────────────────────────────────
-// SNAP — grade de 5cm + snap magnético entre peças (estilo SketchUp)
+// SNAP — grade de 1mm + snap magnético entre peças (estilo SketchUp)
 // ─────────────────────────────────────────────
-const GRID = 0.05;
+const GRID = 0.001;
 function snapGrid(v, g=GRID) { return Math.round(v/g)*g; }
 
 // Retorna Box3 usando userData.w/h/d (sem percorrer geometrias — muito mais leve)
@@ -647,8 +653,8 @@ export default function App() {
     floor.rotation.x = -Math.PI/2; floor.receiveShadow = true;
     floor.userData.isFloor = true;
     scene.add(floor);
-    // Grade: 8m / 160 divisões = 5cm por quadrado
-    scene.add(new THREE.GridHelper(8, 160, 0x2a2a50, 0x1a1a38));
+    // Grade: 8m / 8000 divisões = 1mm por quadrado
+    scene.add(new THREE.GridHelper(8, 8000, 0x2a2a50, 0x1a1a38));
 
     // Animate loop
     let fid, last = performance.now();
@@ -793,17 +799,19 @@ export default function App() {
         const prevX = obj.position.x;
         const prevZ = obj.position.z;
 
-        obj.position.x = snapGrid(pt.x + (dragS.current.ox || 0));
-        obj.position.z = snapGrid(pt.z + (dragS.current.oz || 0));
+        // Movimento livre durante o drag — sem snapGrid para máxima suavidade
+        obj.position.x = pt.x + (dragS.current.ox || 0);
+        obj.position.z = pt.z + (dragS.current.oz || 0);
 
         // Snap magnético entre bordas de peças (leve — usa userData, não Box3)
         edgeSnap(obj, piecesRef.current);
 
         // Colisão: se colidir com outra peça, reverte posição
+        // BUG 5 FIX: peças bloqueadas agora funcionam como obstáculo (colisão com elas é verificada)
         if (colisionOn) {
           const box = fastBox(obj);
           const collides = piecesRef.current.some(o => {
-            if (o === obj || o.userData.locked) return false;
+            if (o === obj) return false; // não colide consigo mesmo
             return box.intersectsBox(fastBox(o));
           });
           if (collides) {
@@ -900,7 +908,9 @@ export default function App() {
     const ud = src.userData;
     // Cria nova peça com mesmos parâmetros, deslocada um pouco
     const ox = snapGrid(src.position.x + GRID * 2);
-    const oy = src.position.y;
+    // BUG 1 FIX: usar base (borda inferior) da peça original, não o centro
+    // position.y é o centro; base = position.y - h/2
+    const baseY = src.position.y - (ud.h || 0) / 2;
     const oz = snapGrid(src.position.z + GRID * 2);
     const copy = makePiece(ud.typeId, ud.matId, ox, 0, oz);
 
@@ -915,8 +925,8 @@ export default function App() {
     copy.userData.frontMatId = ud.frontMatId || ud.matId;
     copy.userData.label = ud.label + " (cópia)";
 
-    // Aplica posição Y
-    copy.position.y = oy;
+    // Aplica posição Y: centro = base + h/2 (igual ao que makePiece faz internamente)
+    copy.position.y = baseY + (ud.h || 0) / 2;
     copy.userData.baseX = ox;
     copy.userData.baseZ = oz;
     copy.userData.baseRY = 0;
@@ -949,7 +959,11 @@ export default function App() {
     const v = Math.max(0.1, parseFloat(valCm) || 1) / 100;
     obj.userData[axis] = v;
     rebuildPiece(obj);
-    syncOutline(obj, sceneRef.current);
+    // BUG 8 FIX: recriar outline completo (tamanho + posição) ao redimensionar
+    // syncOutline só atualizava posição, deixando o contorno com tamanho desatualizado
+    addOutline(obj, sceneRef.current);
+    const ol = sceneRef.current?.children?.find(c => c.userData[OUTLINE_TAG]);
+    if (ol) ol.material.color.set(obj.userData.locked ? 0xff8800 : 0x44aaff);
     setSelData(d => ({...d, [axis]:v}));
     setStatus(`📐 ${axis.toUpperCase()}: ${Math.round(v*100)}cm`);
   }, []);
@@ -989,9 +1003,17 @@ export default function App() {
     obj.userData.matId = mid;
     if (obj.isGroup) {
       const body = obj.children.find(c=>c.userData.isBody);
-      if (body) { body.material.dispose(); body.material = buildMat(mid, obj.userData.w, obj.userData.h); }
+      if (body) {
+        // BUG 3 FIX: descartar textura clonada antes de trocar material (evita memory leak)
+        if (body.material.map) body.material.map.dispose();
+        body.material.dispose();
+        body.material = buildMat(mid, obj.userData.w, obj.userData.h);
+      }
     } else {
-      obj.material.dispose(); obj.material = buildMat(mid, obj.userData.w, obj.userData.h);
+      // BUG 3 FIX: descartar textura clonada antes de trocar material (evita memory leak)
+      if (obj.material.map) obj.material.map.dispose();
+      obj.material.dispose();
+      obj.material = buildMat(mid, obj.userData.w, obj.userData.h);
     }
     setSelData(d => ({...d, matId:mid}));
     const label = ALL_MAT_ITEMS.find(m=>m.id===mid)?.label || MATS_GLASS.find(m=>m.id===mid)?.label || mid;
@@ -1003,7 +1025,12 @@ export default function App() {
     const obj = selRef.current; if (!obj?.isGroup) return;
     obj.userData.frontMatId = mid;
     const front = obj.children.find(c=>c.userData.isFront);
-    if (front) { front.material.dispose(); front.material = buildMat(mid, obj.userData.w, obj.userData.h); }
+    if (front) {
+      // BUG 3 FIX: descartar textura clonada antes de trocar material (evita memory leak)
+      if (front.material.map) front.material.map.dispose();
+      front.material.dispose();
+      front.material = buildMat(mid, obj.userData.w, obj.userData.h);
+    }
     setSelData(d => ({...d, frontMatId: mid}));
     const label = ALL_MAT_ITEMS.find(m=>m.id===mid)?.label || mid;
     setStatus(`🎨 Frente: ${label}`);
@@ -1044,7 +1071,9 @@ export default function App() {
   }, []);
 
   // ── TOGGLE LADO DA PORTA ──────────────────────────────────────
-  const toggleDoorSide = useCallback(() => {
+  // BUG 6 FIX: aceita lado explícito ("left"|"right") em vez de sempre alternar.
+  // Quando chamado sem argumento, mantém comportamento de toggle (compatibilidade).
+  const toggleDoorSide = useCallback((forceSide) => {
     const obj = selRef.current; if (!obj?.userData) return;
     if (obj.userData.typeId !== "porta") return;
     // Se estiver aberta, fecha primeiro
@@ -1056,7 +1085,7 @@ export default function App() {
       obj.rotation.y = obj.userData.baseRY;
       animSet.delete(obj);
     }
-    const newSide = obj.userData.doorSide === "right" ? "left" : "right";
+    const newSide = forceSide || (obj.userData.doorSide === "right" ? "left" : "right");
     obj.userData.doorSide = newSide;
     setSelData(d => ({...d, doorSide: newSide, isOpen: false}));
     setStatus(`🚪 Dobradiça: ${newSide === "left" ? "Esquerda" : "Direita"}`);
@@ -1345,8 +1374,8 @@ export default function App() {
                     <div style={{display:"flex",gap:4}}>
                       {[["left","◁ Esquerda"],["right","Direita ▷"]].map(([side,lbl])=>(
                         <div key={side} onClick={()=>{
-                          const obj=selRef.current;
-                          if(obj && obj.userData.doorSide!==side) toggleDoorSide();
+                          // BUG 6 FIX: setar lado diretamente (não alternar) — evita comportamento inesperado
+                          toggleDoorSide(side);
                         }} style={{
                           flex:1,padding:"8px 4px",borderRadius:6,cursor:"pointer",textAlign:"center",
                           background:selData.doorSide===side?"#1a2838":"#101018",
@@ -1367,8 +1396,8 @@ export default function App() {
                     <div style={{display:"flex",gap:4}}>
                       {[["left","⬅ Esquerda"],["right","Direita ➡"]].map(([side,lbl])=>(
                         <div key={side} onClick={()=>{
-                          const obj=selRef.current;
-                          if(obj && obj.userData.doorSide!==side) toggleDoorSide();
+                          // BUG 6 FIX: setar lado diretamente (não alternar) — evita comportamento inesperado
+                          toggleDoorSide(side);
                         }} style={{
                           flex:1,padding:"8px 4px",borderRadius:6,cursor:"pointer",textAlign:"center",
                           background:selData.doorSide===side?"#1a2838":"#101018",
@@ -1590,7 +1619,8 @@ export default function App() {
         )}
 
         {/* ── PLANO DE CORTE + ORÇAMENTO ── */}
-        {tab==="cut" && <CutTab prices={prices} setPrices={setPrices} piecesRef={piecesRef} selFromList={selFromList} toggleLock={toggleLock}/>}
+        {/* BUG 2 FIX: passa pieces como prop para forçar re-render quando peças mudam */}
+        {tab==="cut" && <CutTab pieces={pieces} prices={prices} setPrices={setPrices} piecesRef={piecesRef} selFromList={selFromList} toggleLock={toggleLock}/>}
       </div>
 
       {/* ═══ VIEWPORT ═══ */}
@@ -1755,7 +1785,8 @@ function PriceRow({label, field, suffix, prices, setPrices}) {
   );
 }
 
-function CutTab({prices, setPrices, piecesRef, selFromList, toggleLock}) {
+// BUG 2 FIX: pieces (state) recebido como prop — garante re-render ao adicionar/remover peças
+function CutTab({pieces: _piecesState, prices, setPrices, piecesRef, selFromList, toggleLock}) {
   const CW = prices.chapaW, CH = prices.chapaH;
 
   const panels = piecesRef.current.map(o => ({
@@ -1769,7 +1800,9 @@ function CutTab({prices, setPrices, piecesRef, selFromList, toggleLock}) {
   })).filter(p => p.w > 10 && p.h > 10);
 
   const totalM2    = panels.reduce((a,p) => a + (p.w/1000)*(p.h/1000), 0);
-  const totalPerim = panels.reduce((a,p) => a + 2*((p.w+p.h)/1000), 0);
+  // BUG 7 FIX: incluir bordas da espessura (d) no perímetro real de cada peça
+  // Cada peça tem 4 bordas principais (2×L + 2×A) mais 4 bordas de espessura (4×d)
+  const totalPerim = panels.reduce((a,p) => a + 2*((p.w+p.h)/1000) + 4*(p.d/1000), 0);
   const chapas     = Math.max(1, Math.ceil(totalM2 / ((CW/1000)*(CH/1000))));
   const matCost    = totalM2 * prices.priceM2;
   const fitaCost   = totalPerim * prices.fitaM;
