@@ -1,2 +1,2 @@
 # IA
-Testes com IA
+Vibe codes
